@@ -23,7 +23,7 @@ assert_eq!(hash_canonical(&commuted), hash_canonical(&normalized));
 # Ok::<(), sqlparser_canonicalize::CanonicalizeError>(())
 ```
 
-Canonical text, and so every hash, is stable within a minor version. A new minor version may spell some predicates differently, so keys stored under one minor version are rebuilt after upgrading to the next. A predicate the crate cannot spell in one way that reads back as the same predicate is refused, never keyed.
+Canonical text, and so every hash, is stable within a minor version. A new minor version may spell some predicates differently, so keys stored under one minor version are rebuilt after upgrading to the next. A predicate the crate cannot spell in one way that reads back as the same predicate, including a subquery carrying table hints or index directives, is refused, never keyed.
 
 The dialect belongs to the canonicalizer because it decides the answer: whether `"Status"` and `Status` are one column or two is a PostgreSQL question, not a SQL one.
 

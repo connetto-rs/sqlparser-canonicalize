@@ -1071,12 +1071,12 @@ fn subquery_text(
         partitions,
         json_path: None,
         sample: None,
-        index_hints,
+        index_directives,
     } = &select.from[0].relation
     else {
         return Err(unsupported("a table option"));
     };
-    if !with_hints.is_empty() || !partitions.is_empty() || !index_hints.is_empty() {
+    if !with_hints.is_empty() || !partitions.is_empty() || !index_directives.is_empty() {
         return Err(unsupported("a table hint"));
     }
     let items = select

@@ -102,6 +102,36 @@ fn two_different_membership_terms_are_two_predicates() {
 }
 
 #[test]
+fn a_plain_membership_subquery_is_canonicalized() {
+    for dialect in [&MySqlDialect {} as &dyn Dialect, &SQLiteDialect {}] {
+        let result = Canonicalizer::new(dialect)
+            .normalize_sql("SELECT * FROM orders WHERE id IN (SELECT id FROM items)");
+        assert_eq!(result.as_deref(), Ok("id IN (SELECT id FROM items)"));
+    }
+}
+
+#[test]
+fn subquery_index_directives_are_refused() {
+    for (dialect, directives) in [
+        (
+            &MySqlDialect {} as &dyn Dialect,
+            &["USE INDEX (idx)", "FORCE INDEX (idx)", "IGNORE INDEX (idx)"][..],
+        ),
+        (&SQLiteDialect {}, &["INDEXED BY idx", "NOT INDEXED"][..]),
+    ] {
+        for directive in directives {
+            let sql =
+                format!("SELECT * FROM orders WHERE id IN (SELECT id FROM items {directive})");
+            let result = Canonicalizer::new(dialect).normalize_sql(&sql);
+            assert!(
+                matches!(result, Err(CanonicalizeError::Unsupported(_))),
+                "{sql} must refuse the index directive, got {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_normalize_no_where() {
     let dialect = PostgreSqlDialect {};
 
