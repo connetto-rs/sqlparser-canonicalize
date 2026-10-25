@@ -454,6 +454,19 @@ fn normalize_expr_inner(
                     normalize_expr_inner(expr, depth + 1, true, context)?,
                     subquery_text(subquery, depth, context)?
                 ),
+                InTarget::Table { name, args } => {
+                    let mut text = format!(
+                        "{} {modifiers}IN {}",
+                        normalize_expr_inner(expr, depth + 1, true, context)?,
+                        object_name_text(name, NamePlace::Operand, context)?
+                    );
+                    if let Some(args) = args {
+                        text.push('(');
+                        append_function_args(&mut text, args, depth, context)?;
+                        text.push(')');
+                    }
+                    text
+                }
                 InTarget::Unnest(_) => return Err(refused("IN UNNEST")),
             }
         }
@@ -1176,21 +1189,32 @@ fn function_text(
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
                 return Err(unsupported());
             }
-            let args = list
-                .args
-                .iter()
-                .map(|arg| match arg {
-                    // Enclosed like an operand, because a bare `a IN (b)` argument makes
-                    // `POSITION(a IN (b))` read back as the special form of `POSITION`.
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) => {
-                        normalize_expr_inner(arg, depth + 1, true, context)
-                    }
-                    _ => Err(unsupported()),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(format!("{name}({})", args.join(", ")))
+            let mut text = name;
+            text.push('(');
+            append_function_args(&mut text, &list.args, depth, context)?;
+            text.push(')');
+            Ok(text)
         }
     }
+}
+
+/// Encloses predicate arguments so they cannot read back as special call syntax.
+fn append_function_args(
+    text: &mut String,
+    args: &[FunctionArg],
+    depth: usize,
+    context: &Canonicalizer<'_>,
+) -> Result<(), CanonicalizeError> {
+    for (index, arg) in args.iter().enumerate() {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) = arg else {
+            return Err(refused("a named or wildcard function argument"));
+        };
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(&normalize_expr_inner(arg, depth + 1, true, context)?);
+    }
+    Ok(())
 }
 
 /// Spells a comma separated list of expressions in their written order.

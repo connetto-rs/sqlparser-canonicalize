@@ -199,6 +199,26 @@ pub fn meaning(expr: &Expr, folding: Folding) -> String {
             m(expr),
             query_meaning(subquery, folding)
         ),
+        Expr::In {
+            expr,
+            target: InTarget::Table { name, args },
+            negated,
+            global,
+        } => {
+            let args = args.as_ref().map(|args| {
+                args.iter()
+                    .map(|arg| match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) => m(arg),
+                        other => other.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            format!(
+                "(in-table {global} {negated} {} {} {args:?})",
+                m(expr),
+                object_name(name, folding)
+            )
+        }
         Expr::Exists { subquery, negated } => {
             format!("(exists {negated} {})", query_meaning(subquery, folding))
         }
