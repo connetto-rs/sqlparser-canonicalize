@@ -111,6 +111,50 @@ fn a_plain_membership_subquery_is_canonicalized() {
 }
 
 #[test]
+fn table_membership_normalizes_names_and_operands() {
+    assert_canonical(
+        &SQLiteDialect {},
+        &[
+            ("X IN Widgets", "x IN widgets"),
+            ("x in \"WIDGETS\"", "x IN widgets"),
+            ("X NOT IN Main.Widgets", "x NOT IN main.widgets"),
+            ("(A = 1) IN [Db].[Widgets]", "(1 = a) IN db.widgets"),
+            ("x IN \"order\"", "x IN \"order\""),
+            ("x IN \"odd\"\"name\"", "x IN \"odd\"\"name\""),
+        ],
+    );
+    assert_canonical(
+        &GenericDialect {},
+        &[("X IN Main.Items", "X IN Main.Items")],
+    );
+}
+
+#[test]
+fn table_membership_keeps_function_arguments_in_order() {
+    assert_canonical(
+        &SQLiteDialect {},
+        &[
+            ("X IN Main.F(A = 1, (B))", "x IN main.f((1 = a), b)"),
+            ("x NOT IN F(B, A = 1)", "x NOT IN f(b, (1 = a))"),
+            ("x IN F()", "x IN f()"),
+            ("x IN F", "x IN f"),
+            ("x IN F(1, 2)", "x IN f(1, 2)"),
+            ("x IN F(2, 1)", "x IN f(2, 1)"),
+            ("x IN F('a', NULL)", "x IN f('a', NULL)"),
+            ("x IN F(x IN items)", "x IN f((x IN items))"),
+        ],
+    );
+}
+
+#[test]
+fn table_membership_refuses_non_expression_arguments() {
+    assert_unsupported(
+        &SQLiteDialect {},
+        &["x IN f(*)", "x IN f(t.*)", "x IN f(name => a)"],
+    );
+}
+
+#[test]
 fn subquery_index_directives_are_refused() {
     for (dialect, directives) in [
         (
@@ -1277,7 +1321,13 @@ fn a_name_spelled_like_an_operator_is_quoted_or_refused() {
             "(1 = POSITION((\"NOT\" - B) IN A))",
         )],
     );
-    assert_unsupported(&GenericDialect {}, &["POSITION(NOT - (b) IN a) = 1"]);
+    assert_canonical(
+        &GenericDialect {},
+        &[(
+            "POSITION(NOT - (b) IN a) = 1",
+            "(1 = POSITION((NOT (- b IN a))))",
+        )],
+    );
 }
 
 #[test]

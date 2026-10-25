@@ -6,7 +6,7 @@
 [![Docs](https://docs.rs/sqlparser-canonicalize/badge.svg)](https://docs.rs/sqlparser-canonicalize)
 [![License](https://img.shields.io/crates/l/sqlparser-canonicalize.svg)](https://github.com/connetto-rs/sqlparser-canonicalize/blob/main/LICENSE)
 
-`sqlparser-canonicalize` produces canonical predicate text and stable hashes from `sqlparser` syntax trees. Equivalent predicate spellings produce identical bytes for durable deduplication.
+`sqlparser-canonicalize` produces canonical predicate text and stable hashes from `sqlparser` syntax trees. Equivalent predicate spellings produce identical bytes for durable deduplication. SQLite `IN` table and table-function targets retain their shorthand, with function arguments kept in order.
 
 ```rust
 use sqlparser::dialect::PostgreSqlDialect;
