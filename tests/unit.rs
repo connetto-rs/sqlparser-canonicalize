@@ -1497,6 +1497,27 @@ fn a_subquery_table_alias_is_kept_folded_as_a_qualifier() {
 }
 
 #[test]
+fn a_subquery_table_keeps_only_and_drops_the_descendants_star() {
+    for dialect in [&PostgreSqlDialect {} as &dyn Dialect, &GenericDialect {}] {
+        assert_canonical(
+            dialect,
+            &[
+                ("x IN (SELECT a FROM ONLY u)", "x IN (SELECT a FROM ONLY u)"),
+                (
+                    "x IN (SELECT a FROM ONLY (u) AS v WHERE v.a = 1)",
+                    "x IN (SELECT a FROM ONLY u v WHERE (1 = v.a))",
+                ),
+                ("x IN (SELECT a FROM u *)", "x IN (SELECT a FROM u)"),
+                (
+                    "EXISTS (SELECT 1 FROM s.u * v WHERE v.a = 1)",
+                    "EXISTS (SELECT 1 FROM s.u v WHERE (1 = v.a))",
+                ),
+            ],
+        );
+    }
+}
+
+#[test]
 fn a_list_never_opens_with_an_item_read_as_a_query() {
     assert_canonical(
         &PostgreSqlDialect {},
@@ -1752,6 +1773,24 @@ fn equality_between_two_columns_keeps_its_order_where_the_left_collation_wins() 
         );
     }
     assert_canonical(&PostgreSqlDialect {}, &[("b = a", "(a = b)")]);
+}
+
+#[test]
+fn sqlite_is_and_is_not_share_the_distinct_from_spellings() {
+    assert_canonical(
+        &SQLiteDialect {},
+        &[
+            ("b IS a", "(b IS NOT DISTINCT FROM a)"),
+            ("b IS NOT DISTINCT FROM a", "(b IS NOT DISTINCT FROM a)"),
+            ("b IS NOT a", "(b IS DISTINCT FROM a)"),
+            ("a IS 1", "(1 IS NOT DISTINCT FROM a)"),
+            ("1 IS NOT a", "(1 IS DISTINCT FROM a)"),
+            ("a IS b + 1", "(a IS NOT DISTINCT FROM (1 + b))"),
+            ("(a IS b) = c", "((a IS NOT DISTINCT FROM b) = c)"),
+            // `UNKNOWN` is no SQLite keyword, so this compares with a column.
+            ("flag IS UNKNOWN", "(flag IS NOT DISTINCT FROM unknown)"),
+        ],
+    );
 }
 
 #[test]

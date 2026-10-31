@@ -3,14 +3,15 @@
 //! Two expressions with the same meaning text are the same predicate under every equivalence
 //! the canonicalizer promises. Those are redundant parentheses, the dialect's name folding, the
 //! order of operands and items it treats as unordered, `a > b` for `b < a`, and synonyms such
-//! as `SOME` for `ANY`, `x::T` for `CAST(x AS T)`, a missing `ELSE` for `ELSE NULL`, a table
-//! alias with or without `AS`, and a subquery without `WHERE` for one filtered by `TRUE` where
+//! as `SOME` for `ANY`, `x::T` for `CAST(x AS T)`, SQLite's `a IS b` for `a IS NOT DISTINCT
+//! FROM b`, a missing `ELSE` for `ELSE NULL`, a table alias with or without `AS`, a subquery
+//! table with or without `*`, and a subquery without `WHERE` for one filtered by `TRUE` where
 //! `TRUE` is reserved. Anything else keeps its structure.
 
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastKind, CeilFloorKind, Expr, FunctionArg, FunctionArgExpr,
     FunctionArguments, GroupByExpr, Ident, InTarget, ObjectName, Query, SelectItem, SetExpr,
-    Subscript, TableFactor, UnaryOperator, Value,
+    Subscript, TableFactor, TableInheritance, UnaryOperator, Value,
 };
 use sqlparser::dialect::{AnsiDialect, Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 
@@ -151,15 +152,25 @@ pub fn meaning(expr: &Expr, folding: Folding) -> String {
             let (left, right) = unordered(left, right, folding);
             format!("({op} {left} {right})")
         }
-        Expr::BinaryOp { left, op, right } => format!("({op} {} {})", m(left), m(right)),
-        Expr::IsDistinctFrom(left, right) => {
+        Expr::IsDistinctFrom(left, right)
+        | Expr::BinaryOp {
+            left,
+            op: BinaryOperator::IsNot,
+            right,
+        } => {
             let (left, right) = compared(left, right, folding);
             format!("(distinct {left} {right})")
         }
-        Expr::IsNotDistinctFrom(left, right) => {
+        Expr::IsNotDistinctFrom(left, right)
+        | Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Is,
+            right,
+        } => {
             let (left, right) = compared(left, right, folding);
             format!("(not-distinct {left} {right})")
         }
+        Expr::BinaryOp { left, op, right } => format!("({op} {} {})", m(left), m(right)),
         Expr::UnaryOp { op, expr } => match (op, strip_nested(expr)) {
             // `NOT (EXISTS q)` and `NOT EXISTS q` are one test.
             (
@@ -554,9 +565,17 @@ fn query_meaning(query: &Query, folding: Folding) -> String {
     if !simple {
         return query.to_string();
     }
-    let TableFactor::Table { name, alias, .. } = &select.from[0].relation else {
+    let TableFactor::Table {
+        name,
+        alias,
+        inheritance,
+        ..
+    } = &select.from[0].relation
+    else {
         return query.to_string();
     };
+    // `ONLY` leaves out descendant tables, which a bare name and `name *` both read.
+    let only = matches!(inheritance, Some(TableInheritance::Only { .. }));
     // A table alias only names the table, so its meaning is its folded name.
     let alias = match alias {
         None => None,
@@ -590,7 +609,7 @@ fn query_meaning(query: &Query, folding: Folding) -> String {
         .filter(|filter| !(folding.true_is_reserved && is_true(filter)))
         .map(|filter| meaning(filter, folding));
     format!(
-        "(select [{}] {} {alias:?} {filter:?})",
+        "(select [{}] {only} {} {alias:?} {filter:?})",
         items.join(" "),
         table.join(".")
     )
