@@ -52,5 +52,5 @@ fn fixed_corpus_allocation_count_does_not_grow() {
     let counts = std::array::from_fn::<_, 16, _>(|_| measure(sql));
     // Two passes over the predicate, the original statement parse and the expression
     // re-read that proves the canonical text reads as itself.
-    assert_eq!(counts, [399; 16]);
+    assert_eq!(counts, [386; 16]);
 }
