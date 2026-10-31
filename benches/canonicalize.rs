@@ -36,9 +36,10 @@ fn wide_in_list(items: usize) -> String {
     format!("SELECT * FROM t WHERE x IN ({})", values.join(", "))
 }
 
+/// Short names keep the widest chain within the crate's 8192-byte input limit.
 fn long_boolean_chain(terms: usize) -> String {
     let predicates: Vec<String> = (0..terms)
-        .map(|term| format!("col_{:03} = {}", terms - term, term))
+        .map(|term| format!("c{:03} = {}", terms - term, term))
         .collect();
     format!("SELECT * FROM t WHERE {}", predicates.join(" AND "))
 }
