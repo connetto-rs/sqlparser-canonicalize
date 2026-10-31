@@ -361,11 +361,24 @@ fn normalize_expr_inner(
                     .map(|child| normalize_expr_inner(child, depth + 1, false, context))
                     .collect::<Result<_, _>>()?;
                 child_text.sort();
+                // One level of parentheses around the whole chain keeps reading it back
+                // within the parser's recursion limit however long the chain is.
                 let operator = operator_text(op)?;
-                child_text
-                    .into_iter()
-                    .reduce(|left, right| format!("({left} {operator} {right})"))
-                    .unwrap_or_default()
+                let length = child_text.iter().map(String::len).sum::<usize>()
+                    + (child_text.len() - 1) * (operator.len() + 2)
+                    + 2;
+                let mut text = String::with_capacity(length);
+                text.push('(');
+                for (index, child) in child_text.iter().enumerate() {
+                    if index > 0 {
+                        text.push(' ');
+                        text.push_str(operator);
+                        text.push(' ');
+                    }
+                    text.push_str(child);
+                }
+                text.push(')');
+                text
             } else {
                 let operator = operator_text(op)?;
                 let order = operand_order(op, context);
