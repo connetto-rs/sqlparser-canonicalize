@@ -737,23 +737,25 @@ fn test_reject_mysql_pattern_ending_with_the_escape() {
     );
 }
 
-/// What caps an `AND` chain's canonical nesting is the parser's depth budget for the
-/// re-read rather than any length rule, so text inside the budget must be accepted.
+/// A chain's canonical text is one level deep however many terms it has, so reading it back
+/// stays within the parser's recursion limit.
 #[test]
-fn test_deep_and_chain_is_accepted_up_to_the_read_back_budget() {
-    let dialect = PostgreSqlDialect {};
-    let canonicalizer = Canonicalizer::new(&dialect);
-    let chain = |terms: usize| {
-        let parts: Vec<String> = (1..=terms)
-            .map(|term| format!("c{term} = {term}"))
-            .collect();
-        format!("SELECT * FROM t WHERE {}", parts.join(" AND "))
-    };
-    assert!(canonicalizer.normalize_sql(&chain(46)).is_ok());
-    assert!(matches!(
-        canonicalizer.normalize_sql(&chain(47)),
-        Err(CanonicalizeError::NotRoundTrippable(_))
-    ));
+fn test_long_boolean_chain_is_spelled_flat() {
+    let canonicalizer = Canonicalizer::new(&PostgreSqlDialect {});
+    for operator in ["AND", "OR"] {
+        let terms: Vec<String> = (0..300).map(|term| format!("c{term} = {term}")).collect();
+        let sql = format!(
+            "SELECT * FROM t WHERE {}",
+            terms.join(&format!(" {operator} "))
+        );
+        let mut expected: Vec<String> =
+            (0..300).map(|term| format!("({term} = c{term})")).collect();
+        expected.sort();
+        assert_eq!(
+            canonicalizer.normalize_sql(&sql).unwrap(),
+            format!("({})", expected.join(&format!(" {operator} ")))
+        );
+    }
 }
 
 /// A delimited name escapes its own delimiter by doubling it, and the canonical spelling has
