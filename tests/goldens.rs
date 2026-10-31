@@ -856,8 +856,8 @@ const GOLDENS: &[Golden] = &[
     Golden {
         dialect: DialectKind::SQLite,
         sql: "SELECT * FROM t WHERE Flag IS UNKNOWN",
-        normalized: "flag IS UNKNOWN",
-        hash: 268016679043104776737949376478094949884,
+        normalized: "(flag IS NOT DISTINCT FROM unknown)",
+        hash: 146294889612496539165456862934178885956,
     },
     Golden {
         dialect: DialectKind::PostgreSql,

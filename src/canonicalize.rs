@@ -10,7 +10,7 @@ use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DateTimeField, Distinct, Expr,
     ExtractSyntax, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     InTarget, Interval, LimitClause, ObjectName, Query, Select, SelectItem, SelectModifiers,
-    SetExpr, Statement, Subscript, TableAlias, TableFactor, UnaryOperator, Value,
+    SetExpr, Statement, Subscript, TableAlias, TableFactor, TableInheritance, UnaryOperator, Value,
 };
 use sqlparser::dialect::{AnsiDialect, Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::keywords::ALL_KEYWORDS;
@@ -1054,7 +1054,9 @@ fn refused(form: &str) -> CanonicalizeError {
 /// Inside a subquery, grouping, ordering and column aliases change which rows the outer
 /// predicate sees, so they are refused along with every clause an outer query may not carry.
 /// A table alias only names the table for the qualifiers that follow, so it is kept, folded as
-/// a qualifier and written without `AS`, which Oracle refuses there.
+/// a qualifier and written without `AS`, which Oracle refuses there. `ONLY` keeps descendant
+/// tables out of the rows read, so it is kept, while `u *` reads what a bare `u` reads and is
+/// written as `u`.
 fn subquery_text(
     query: &Query,
     depth: usize,
@@ -1085,6 +1087,7 @@ fn subquery_text(
         json_path: None,
         sample: None,
         index_directives,
+        inheritance,
     } = &select.from[0].relation
     else {
         return Err(unsupported("a table option"));
@@ -1122,7 +1125,11 @@ fn subquery_text(
         })
         .collect::<Result<Vec<_>, _>>()?
         .join(".");
-    let mut text = format!("SELECT {items} FROM {table}");
+    let only = match inheritance {
+        Some(TableInheritance::Only { parenthesized: _ }) => "ONLY ",
+        Some(TableInheritance::IncludeDescendants) | None => "",
+    };
+    let mut text = format!("SELECT {items} FROM {only}{table}");
     if let Some(TableAlias {
         explicit: _,
         name,
@@ -1788,9 +1795,11 @@ fn collect_flat_children<'a>(expr: &'a Expr, operator: &BinaryOperator) -> Vec<&
 /// `AND` and `OR` never reach here, because their chains are flattened and sorted whole.
 const fn operand_order(operator: &BinaryOperator, context: &Canonicalizer<'_>) -> OperandOrder {
     match operator {
-        BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Spaceship => {
-            OperandOrder::Compared
-        }
+        BinaryOperator::Eq
+        | BinaryOperator::NotEq
+        | BinaryOperator::Spaceship
+        | BinaryOperator::Is
+        | BinaryOperator::IsNot => OperandOrder::Compared,
         // SQL Server also concatenates strings with `+`, where the order matters.
         BinaryOperator::Plus | BinaryOperator::Multiply if context.plus_is_numeric => {
             OperandOrder::Sorted
@@ -1819,6 +1828,9 @@ fn operator_text(operator: &BinaryOperator) -> Result<&'static str, Canonicalize
         BinaryOperator::Multiply => Ok("*"),
         BinaryOperator::Divide => Ok("/"),
         BinaryOperator::Modulo => Ok("%"),
+        // SQLite also spells `IS NOT DISTINCT FROM` as `IS`, and `IS DISTINCT FROM` as `IS NOT`.
+        BinaryOperator::Is => Ok("IS NOT DISTINCT FROM"),
+        BinaryOperator::IsNot => Ok("IS DISTINCT FROM"),
         other => Err(CanonicalizeError::Unsupported(format!(
             "Unsupported binary operator: {other}"
         ))),
