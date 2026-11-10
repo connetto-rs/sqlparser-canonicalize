@@ -362,3 +362,36 @@ fn provider_errors_are_not_silently_treated_as_missing_proofs() {
         ))
     );
 }
+
+#[test]
+fn empty_proved_column_references_are_refused() {
+    let root = parse("weight");
+    let context = Evidence {
+        columns: vec![(&root, Vec::new())],
+        ..Evidence::empty(&root)
+    };
+    assert!(matches!(
+        normalize(&context),
+        Err(CanonicalizeError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn unquotable_column_and_field_roots_are_refused() {
+    let column = || Expr::Identifier(Ident::new("not"));
+    let canonicalizer = Canonicalizer::new(&sqlparser::dialect::GenericDialect {});
+    for root in [
+        column(),
+        Expr::CompoundFieldAccess {
+            root: Box::new(column()),
+            access_chain: vec![sqlparser::ast::AccessExpr::Dot(Expr::Identifier(
+                Ident::new("field"),
+            ))],
+        },
+    ] {
+        assert!(matches!(
+            canonicalizer.normalize_with_context(&Evidence::empty(&root)),
+            Err(CanonicalizeError::Unsupported(_))
+        ));
+    }
+}
