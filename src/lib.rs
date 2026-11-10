@@ -8,8 +8,10 @@ use alloc::string::String;
 use thiserror::Error;
 
 mod canonicalize;
+mod semantic;
 
 pub use canonicalize::{Canonicalizer, hash_canonical};
+pub use semantic::{ComparisonCoercions, SemanticContext};
 
 /// Why a predicate could not be turned into canonical text.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

@@ -7,7 +7,7 @@ use core::hash::{Hash, Hasher};
 
 use seahash::SeaHasher;
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DateTimeField, Distinct, Expr,
+    AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DataType, DateTimeField, Distinct, Expr,
     ExtractSyntax, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     InTarget, Interval, LimitClause, ObjectName, Query, Select, SelectItem, SelectModifiers,
     SetExpr, Statement, Subscript, TableAlias, TableFactor, TableInheritance, UnaryOperator, Value,
@@ -17,10 +17,34 @@ use sqlparser::keywords::ALL_KEYWORDS;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use crate::CanonicalizeError;
+use crate::{CanonicalizeError, SemanticContext};
 
 const MAX_EXPR_DEPTH: usize = 128;
 const MAX_SQL_LEN: usize = 8192;
+
+#[derive(Clone, Copy)]
+enum Rendering<'a> {
+    SchemaFree,
+    Semantic(Option<&'a dyn SemanticContext>),
+}
+
+struct RenderContext<'a> {
+    canonicalizer: &'a Canonicalizer<'a>,
+    rendering: Rendering<'a>,
+}
+
+impl<'a> RenderContext<'a> {
+    const fn is_semantic(&self) -> bool {
+        matches!(self.rendering, Rendering::Semantic(_))
+    }
+
+    const fn evidence(&self) -> Option<&'a dyn SemanticContext> {
+        match self.rendering {
+            Rendering::Semantic(evidence) => evidence,
+            Rendering::SchemaFree => None,
+        }
+    }
+}
 
 impl<'a> Canonicalizer<'a> {
     /// Parses one `SELECT` and returns canonical text for its `WHERE` clause.
@@ -28,8 +52,12 @@ impl<'a> Canonicalizer<'a> {
     /// The canonical text is verified to survive being read back as itself, so a predicate
     /// whose canonical form would read as something else is rejected instead of hashed.
     pub fn normalize_sql(&self, sql: &str) -> Result<String, CanonicalizeError> {
-        let canonical = normalize_sql_inner(sql, self)?;
-        confirm_reads_back_as_itself(canonical, self)
+        let context = RenderContext {
+            canonicalizer: self,
+            rendering: Rendering::SchemaFree,
+        };
+        let canonical = normalize_sql_inner(sql, &context)?;
+        confirm_reads_back_as_itself(canonical, &context)
     }
 
     /// Canonicalizes a parsed `WHERE` clause in O(n log n) time for boolean chains and O(n)
@@ -41,21 +69,47 @@ impl<'a> Canonicalizer<'a> {
         &self,
         where_expr: Option<&Expr>,
     ) -> Result<String, CanonicalizeError> {
-        let canonical = normalize_where_clause_inner(where_expr, self)?;
-        confirm_reads_back_as_itself(canonical, self)
+        let context = RenderContext {
+            canonicalizer: self,
+            rendering: Rendering::SchemaFree,
+        };
+        let canonical = normalize_where_clause_inner(where_expr, &context)?;
+        confirm_reads_back_as_itself(canonical, &context)
+    }
+
+    /// Renders an expression using authorized original-occurrence rewrites without reordering operations.
+    ///
+    /// The expression must use this canonicalizer's dialect and execute in the provider's proved scope.
+    ///
+    /// # Errors
+    /// Returns provider errors or refuses unsupported or non-round-trippable syntax.
+    pub fn normalize_with_context(
+        &self,
+        evidence: &dyn SemanticContext,
+    ) -> Result<String, CanonicalizeError> {
+        let context = RenderContext {
+            canonicalizer: self,
+            rendering: Rendering::Semantic(Some(evidence)),
+        };
+        let canonical = normalize_expr_inner(evidence.expression(), 0, false, &context)?;
+        let replay = RenderContext {
+            rendering: Rendering::Semantic(None),
+            ..context
+        };
+        confirm_reads_back_as_itself(canonical, &replay)
     }
 }
 
 fn normalize_sql_inner(
     sql: &str,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     if sql.len() > MAX_SQL_LEN {
         return Err(CanonicalizeError::InputTooLong { limit: MAX_SQL_LEN });
     }
     check_sql_sanity(sql)?;
 
-    let statements = Parser::parse_sql(context.dialect, sql)
+    let statements = Parser::parse_sql(context.canonicalizer.dialect, sql)
         .map_err(|error| CanonicalizeError::Parse(error.to_string()))?;
     let [statement] = statements.as_slice() else {
         return Err(CanonicalizeError::Unsupported(
@@ -68,7 +122,7 @@ fn normalize_sql_inner(
 
 fn normalize_where_clause_inner(
     where_expr: Option<&Expr>,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     match where_expr {
         Some(expr) => normalize_expr_inner(expr, 0, false, context),
@@ -76,7 +130,7 @@ fn normalize_where_clause_inner(
         // `WHERE TRUE`. Elsewhere a bare `TRUE` may name a column, as in SQLite, so it is spelled
         // as `WHERE 1 = 1`, which keeps every row in every dialect.
         None => {
-            let every_row = if context.true_is_reserved {
+            let every_row = if context.canonicalizer.true_is_reserved {
                 Expr::Value(Value::Boolean(true).with_empty_span())
             } else {
                 let one = || {
@@ -103,7 +157,7 @@ fn normalize_where_clause_inner(
 /// because a statement around it adds only scaffolding no caller sent.
 fn confirm_reads_back_as_itself(
     canonical: String,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     if read_back(&canonical, context).is_some_and(|again| again == canonical) {
         Ok(canonical)
@@ -113,8 +167,10 @@ fn confirm_reads_back_as_itself(
 }
 
 /// Reads `canonical` back as one complete expression and returns its normalised text.
-fn read_back(canonical: &str, context: &Canonicalizer<'_>) -> Option<String> {
-    let mut parser = Parser::new(context.dialect).try_with_sql(canonical).ok()?;
+fn read_back(canonical: &str, context: &RenderContext<'_>) -> Option<String> {
+    let mut parser = Parser::new(context.canonicalizer.dialect)
+        .try_with_sql(canonical)
+        .ok()?;
     let expr = parser.parse_expr().ok()?;
     // parse_expr takes a leading expression and stops, so require nothing to trail it.
     if !matches!(parser.peek_token_ref().token, Token::EOF) {
@@ -343,7 +399,7 @@ fn normalize_expr_inner(
     expr: &Expr,
     depth: usize,
     tight_parent: bool,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     if depth > MAX_EXPR_DEPTH {
         return Err(CanonicalizeError::TooDeep {
@@ -351,9 +407,47 @@ fn normalize_expr_inner(
         });
     }
 
+    if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        && let Some(evidence) = context.evidence()
+        && let Some(parts) = evidence.column_reference(expr)?
+    {
+        if parts.is_empty() {
+            return Err(CanonicalizeError::Unsupported(
+                "A proved column reference must be nonempty".to_string(),
+            ));
+        }
+        return qualified_name_text(parts.iter(), NamePlace::Operand, context);
+    }
+
     let text = match expr {
         Expr::BinaryOp { left, op, right } => {
-            if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+            if context.is_semantic() {
+                let coercions = if matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::Gt
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::Spaceship
+                        | BinaryOperator::Is
+                        | BinaryOperator::IsNot
+                ) {
+                    context
+                        .evidence()
+                        .map(|evidence| evidence.comparison_coercions(expr))
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                };
+                let left =
+                    coerced_operand_text(left, coercions.and_then(|c| c.left), depth, context)?;
+                let right =
+                    coerced_operand_text(right, coercions.and_then(|c| c.right), depth, context)?;
+                format!("({left} {} {right})", operator_text(op)?)
+            } else if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                 let mut children = collect_flat_children(left, op);
                 children.extend(collect_flat_children(right, op));
                 let mut child_text: Vec<String> = children
@@ -447,8 +541,10 @@ fn normalize_expr_inner(
                         .iter()
                         .map(|item| normalize_expr_inner(item, depth + 1, true, context))
                         .collect::<Result<_, _>>()?;
-                    items.sort();
-                    open_list(&mut items, context);
+                    if !context.is_semantic() {
+                        items.sort();
+                        open_list(&mut items, context);
+                    }
                     let mut text = format!(
                         "{} {modifiers}IN (",
                         normalize_expr_inner(expr, depth + 1, true, context)?
@@ -465,7 +561,7 @@ fn normalize_expr_inner(
                 InTarget::Subquery(subquery) => format!(
                     "{} {modifiers}IN ({})",
                     normalize_expr_inner(expr, depth + 1, true, context)?,
-                    subquery_text(subquery, depth, context)?
+                    subquery_text(subquery, depth, false, context)?
                 ),
                 InTarget::Table { name, args } => {
                     let mut text = format!(
@@ -485,9 +581,12 @@ fn normalize_expr_inner(
         }
         Expr::Exists { subquery, negated } => {
             let not = if *negated { "NOT " } else { "" };
-            format!("{not}EXISTS ({})", subquery_text(subquery, depth, context)?)
+            format!(
+                "{not}EXISTS ({})",
+                subquery_text(subquery, depth, false, context)?
+            )
         }
-        Expr::Subquery(query) => format!("({})", subquery_text(query, depth, context)?),
+        Expr::Subquery(query) => format!("({})", subquery_text(query, depth, true, context)?),
         Expr::Between {
             expr,
             low,
@@ -596,9 +695,12 @@ fn normalize_expr_inner(
             )
         }
         Expr::Nested(inner) => normalize_expr_inner(inner, depth + 1, tight_parent, context)?,
-        Expr::Identifier(identifier) => {
-            identifier_text(identifier, context.folding, NamePlace::Operand, context)?
-        }
+        Expr::Identifier(identifier) => identifier_text(
+            identifier,
+            context.canonicalizer.folding,
+            NamePlace::Operand,
+            context,
+        )?,
         Expr::CompoundIdentifier(parts) => {
             qualified_name_text(parts.iter(), NamePlace::Operand, context)?
         }
@@ -833,6 +935,19 @@ fn normalize_expr_inner(
     })
 }
 
+fn coerced_operand_text(
+    expr: &Expr,
+    target: Option<&DataType>,
+    depth: usize,
+    context: &RenderContext<'_>,
+) -> Result<String, CanonicalizeError> {
+    let text = normalize_expr_inner(expr, depth + 1, target.is_none(), context)?;
+    Ok(match target {
+        Some(target) => format!("CAST({text} AS {target})"),
+        None => text,
+    })
+}
+
 /// How a binary operator treats the order of its operands.
 #[derive(Clone, Copy)]
 enum OperandOrder {
@@ -855,14 +970,19 @@ fn infix_text(
     right: &Expr,
     order: OperandOrder,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     // Where the left operand's collation wins, as in SQLite, two operands may only swap when
     // one of them is a literal, which has no collation of its own.
-    let swappable =
-        context.collation_is_symmetric || is_literal(left, context) || is_literal(right, context);
+    let swappable = !context.is_semantic()
+        && (context.canonicalizer.collation_is_symmetric
+            || is_literal(left, context)
+            || is_literal(right, context));
     let left = normalize_expr_inner(left, depth + 1, true, context)?;
     let right = normalize_expr_inner(right, depth + 1, true, context)?;
+    if context.is_semantic() {
+        return Ok(format!("({left} {operator} {right})"));
+    }
     let (left, operator, right) = match order {
         OperandOrder::Sorted if left > right => (right, operator, left),
         OperandOrder::Compared if swappable && left > right => (right, operator, left),
@@ -883,7 +1003,7 @@ fn postfix_text(
     operand: &Expr,
     suffix: &str,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let operand = normalize_expr_inner(operand, depth + 1, true, context)?;
     Ok(format!("{operand} {suffix}"))
@@ -917,7 +1037,7 @@ fn pattern_match_text(
     pattern: &Expr,
     escape: Option<&Expr>,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let subject = normalize_expr_inner(subject, depth + 1, true, context)?;
     let pattern = if any {
@@ -942,7 +1062,7 @@ fn quantified_text(
     quantifier: &str,
     right: &Expr,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let left = normalize_expr_inner(left, depth + 1, true, context)?;
     let operator = operator_text(operator)?;
@@ -955,7 +1075,7 @@ fn quantified_text(
 fn argument_text(
     argument: &Expr,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let text = normalize_expr_inner(argument, depth + 1, false, context)?;
     let mut inner = argument;
@@ -996,16 +1116,16 @@ fn reject_quantifier_name(name: &ObjectName) -> Result<(), CanonicalizeError> {
 fn qualified_name_text<'i>(
     parts: impl ExactSizeIterator<Item = &'i Ident>,
     place: NamePlace,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let column = parts.len().saturating_sub(1);
     Ok(parts
         .enumerate()
         .map(|(index, part)| {
             let folding = if index == column {
-                context.folding
+                context.canonicalizer.folding
             } else {
-                context.qualifier_folding
+                context.canonicalizer.qualifier_folding
             };
             identifier_text(part, folding, place, context)
         })
@@ -1019,7 +1139,7 @@ fn qualified_name_text<'i>(
 /// Enclosing hides a query that only starts an item, as in `(SELECT a FROM u)[1]`, and a bare
 /// subquery keeps its query first however many parentheses enclose it. Every other item keeps
 /// its sorted place, and a list whose items all start with a query fails to read back.
-fn open_list(items: &mut [String], context: &Canonicalizer<'_>) {
+fn open_list(items: &mut [String], context: &RenderContext<'_>) {
     if items
         .first()
         .is_none_or(|head| !starts_with_query(head, context))
@@ -1045,13 +1165,13 @@ fn open_list(items: &mut [String], context: &Canonicalizer<'_>) {
 /// Reports whether sqlparser reads a query at the start of `text`, as it tries to at the start
 /// of an `IN` list. A query starts with a parenthesis or a keyword, so any other text is
 /// answered without parsing.
-fn starts_with_query(text: &str, context: &Canonicalizer<'_>) -> bool {
+fn starts_with_query(text: &str, context: &RenderContext<'_>) -> bool {
     let first_word = text
         .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
         .next()
         .unwrap_or_default();
     (text.starts_with('(') || is_keyword(first_word))
-        && Parser::new(context.dialect)
+        && Parser::new(context.canonicalizer.dialect)
             .try_with_sql(text)
             .and_then(|mut parser| parser.parse_query())
             .is_ok()
@@ -1064,8 +1184,7 @@ fn refused(form: &str) -> CanonicalizeError {
 
 /// Spells a subquery in the shape the crate serves, `SELECT items FROM table [WHERE filter]`.
 ///
-/// Inside a subquery, grouping, ordering and column aliases change which rows the outer
-/// predicate sees, so they are refused along with every clause an outer query may not carry.
+/// Grouping and ordering are refused, and projection aliases require a scalar output-name non-use proof.
 /// A table alias only names the table for the qualifiers that follow, so it is kept, folded as
 /// a qualifier and written without `AS`, which Oracle refuses there. `ONLY` keeps descendant
 /// tables out of the rows read, so it is kept, while `u *` reads what a bare `u` reads and is
@@ -1073,7 +1192,8 @@ fn refused(form: &str) -> CanonicalizeError {
 fn subquery_text(
     query: &Query,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    scalar: bool,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let unsupported = |part: &str| {
         CanonicalizeError::Unsupported(format!("{part} in a subquery is not supported"))
@@ -1113,6 +1233,14 @@ fn subquery_text(
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) => normalize_expr_inner(expr, depth + 1, false, context),
+            SelectItem::ExprWithAlias { expr, .. }
+                if context.is_semantic()
+                    && context.canonicalizer.dialect.is::<PostgreSqlDialect>()
+                    && scalar
+                    && select.projection.len() == 1 =>
+            {
+                normalize_expr_inner(expr, depth + 1, false, context)
+            }
             SelectItem::Wildcard(options)
                 if options.opt_ilike.is_none()
                     && options.opt_exclude.is_none()
@@ -1131,9 +1259,12 @@ fn subquery_text(
         .0
         .iter()
         .map(|part| match part.as_ident() {
-            Some(part) => {
-                identifier_text(part, context.qualifier_folding, NamePlace::Operand, context)
-            }
+            Some(part) => identifier_text(
+                part,
+                context.canonicalizer.qualifier_folding,
+                NamePlace::Operand,
+                context,
+            ),
             None => Err(unsupported("a computed table name")),
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -1156,7 +1287,7 @@ fn subquery_text(
         text.push(' ');
         text.push_str(&identifier_text(
             name,
-            context.qualifier_folding,
+            context.canonicalizer.qualifier_folding,
             NamePlace::Operand,
             context,
         )?);
@@ -1165,7 +1296,7 @@ fn subquery_text(
     if let Some(filter) = select
         .selection
         .as_ref()
-        .filter(|filter| !(context.true_is_reserved && is_true(filter)))
+        .filter(|filter| !(context.canonicalizer.true_is_reserved && is_true(filter)))
     {
         text.push_str(" WHERE ");
         text.push_str(&normalize_expr_inner(filter, depth + 1, false, context)?);
@@ -1177,7 +1308,7 @@ fn subquery_text(
 fn function_text(
     function: &Function,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let Function {
         name,
@@ -1223,7 +1354,7 @@ fn append_function_args(
     text: &mut String,
     args: &[FunctionArg],
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<(), CanonicalizeError> {
     for (index, arg) in args.iter().enumerate() {
         let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) = arg else {
@@ -1241,7 +1372,7 @@ fn append_function_args(
 fn list_text(
     items: &[Expr],
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     Ok(items
         .iter()
@@ -1256,7 +1387,7 @@ fn rounding_text(
     expr: &Expr,
     field: &CeilFloorKind,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let expr = normalize_expr_inner(expr, depth + 1, false, context)?;
     Ok(match field {
@@ -1270,7 +1401,7 @@ fn rounding_text(
 fn interval_text(
     interval: &Interval,
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let Interval {
         value,
@@ -1315,16 +1446,19 @@ fn field_access_text(
     root: &Expr,
     access_chain: &[AccessExpr],
     depth: usize,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let mut text = match root {
         Expr::Nested(inner) => format!(
             "({})",
             normalize_expr_inner(inner, depth + 1, false, context)?
         ),
-        Expr::Identifier(name) => {
-            identifier_text(name, context.qualifier_folding, NamePlace::Operand, context)?
-        }
+        Expr::Identifier(name) => identifier_text(
+            name,
+            context.canonicalizer.qualifier_folding,
+            NamePlace::Operand,
+            context,
+        )?,
         Expr::Value(_) => return Err(literal_access()),
         root => normalize_expr_inner(root, depth + 1, true, context)?,
     };
@@ -1334,7 +1468,7 @@ fn field_access_text(
                 text.push('.');
                 text.push_str(&identifier_text(
                     name,
-                    context.qualifier_folding,
+                    context.canonicalizer.qualifier_folding,
                     NamePlace::Operand,
                     context,
                 )?);
@@ -1393,14 +1527,16 @@ fn literal_access() -> CanonicalizeError {
 ///
 /// A boolean counts only where `TRUE` is reserved, because SQLite reads `TRUE` and `FALSE` as
 /// columns of those names when the table has them.
-fn is_literal(expr: &Expr, context: &Canonicalizer<'_>) -> bool {
+fn is_literal(expr: &Expr, context: &RenderContext<'_>) -> bool {
     match expr {
         Expr::Nested(inner) => is_literal(inner, context),
         Expr::UnaryOp {
             op: UnaryOperator::Minus | UnaryOperator::Plus,
             expr,
         } => is_literal(expr, context),
-        Expr::Value(value) => context.true_is_reserved || !matches!(value.value, Value::Boolean(_)),
+        Expr::Value(value) => {
+            context.canonicalizer.true_is_reserved || !matches!(value.value, Value::Boolean(_))
+        }
         _ => false,
     }
 }
@@ -1427,7 +1563,7 @@ fn is_null(expr: &Expr) -> bool {
 fn object_name_text(
     name: &ObjectName,
     place: NamePlace,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let parts = name
         .0
@@ -1599,7 +1735,7 @@ fn identifier_text(
     identifier: &Ident,
     folding: Folding,
     place: NamePlace,
-    context: &Canonicalizer<'_>,
+    context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
     let quoted = identifier.quote_style.is_some();
     // Case folding rules are stated for ASCII. Anything else keeps its exact spelling,
@@ -1630,7 +1766,12 @@ fn identifier_text(
     // `"a""b"`. Emitting the delimiter raw produces a name that reads back as something else.
     let quote = identifier
         .quote_style
-        .or_else(|| context.dialect.identifier_quote_style(&resolved))
+        .or_else(|| {
+            context
+                .canonicalizer
+                .dialect
+                .identifier_quote_style(&resolved)
+        })
         .unwrap_or('"');
     let mut delimited = String::with_capacity(resolved.len() + 2);
     delimited.push(quote);
@@ -1806,7 +1947,7 @@ fn collect_flat_children<'a>(expr: &'a Expr, operator: &BinaryOperator) -> Vec<&
 /// Reads how `operator` treats the order of its operands under the canonicalizer's dialect.
 ///
 /// `AND` and `OR` never reach here, because their chains are flattened and sorted whole.
-const fn operand_order(operator: &BinaryOperator, context: &Canonicalizer<'_>) -> OperandOrder {
+const fn operand_order(operator: &BinaryOperator, context: &RenderContext<'_>) -> OperandOrder {
     match operator {
         BinaryOperator::Eq
         | BinaryOperator::NotEq
@@ -1814,7 +1955,9 @@ const fn operand_order(operator: &BinaryOperator, context: &Canonicalizer<'_>) -
         | BinaryOperator::Is
         | BinaryOperator::IsNot => OperandOrder::Compared,
         // SQL Server also concatenates strings with `+`, where the order matters.
-        BinaryOperator::Plus | BinaryOperator::Multiply if context.plus_is_numeric => {
+        BinaryOperator::Plus | BinaryOperator::Multiply
+            if context.canonicalizer.plus_is_numeric =>
+        {
             OperandOrder::Sorted
         }
         BinaryOperator::Lt => OperandOrder::Mirrored(">"),
