@@ -27,6 +27,8 @@ Canonical text, and so every hash, is stable within a minor version. A new minor
 
 The dialect belongs to the canonicalizer because it decides the answer: whether `"Status"` and `Status` are one column or two is a PostgreSQL question, not a SQL one.
 
+For schema-backed expressions, `normalize_with_context` consumes a `SemanticContext` that authorizes bound column spellings and equivalent explicit comparison casts. It preserves operation order and existing casts, and only drops a PostgreSQL scalar projection alias when the supported query structure rules out output-name references. The provider must prove conversion identity, collation, typmod, and implicit-versus-explicit behavior in the execution scope.
+
 Normalization is O(n log n) for `AND` and `OR` chains because operands are sorted, and O(n) for other syntax tree shapes.
 
 The crate works without the standard library if you turn off default features, at the cost of the parser's stack protection, so that configuration can be crashed by deeply nested input and should only take SQL you trust.
