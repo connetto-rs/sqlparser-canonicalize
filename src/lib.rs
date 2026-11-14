@@ -12,7 +12,7 @@ mod semantic;
 
 pub use canonicalize::{Canonicalizer, hash_canonical};
 pub use semantic::{
-    ArrayCoercions, ComparisonCoercions, Conversion, MembershipCoercions, MembershipElement,
+    ArrayCoercions, Conversion, MembershipCoercions, MembershipElement, OperatorCoercions,
     SemanticContext,
 };
 

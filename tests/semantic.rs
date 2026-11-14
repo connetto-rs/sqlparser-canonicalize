@@ -7,14 +7,14 @@ use sqlparser::ast::{
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser_canonicalize::{
-    ArrayCoercions, CanonicalizeError, Canonicalizer, ComparisonCoercions, Conversion,
-    MembershipCoercions, MembershipElement, SemanticContext, hash_canonical,
+    ArrayCoercions, CanonicalizeError, Canonicalizer, Conversion, MembershipCoercions,
+    MembershipElement, OperatorCoercions, SemanticContext, hash_canonical,
 };
 
 struct Evidence<'a> {
     root: &'a Expr,
     columns: Vec<(&'a Expr, Vec<Ident>)>,
-    comparisons: Vec<(&'a Expr, ComparisonCoercions<'a>)>,
+    operators: Vec<(&'a Expr, OperatorCoercions<'a>)>,
     memberships: Vec<(&'a Expr, MembershipCoercions<'a>)>,
     strict: bool,
 }
@@ -24,7 +24,7 @@ impl<'a> Evidence<'a> {
         Self {
             root,
             columns: Vec::new(),
-            comparisons: Vec::new(),
+            operators: Vec::new(),
             memberships: Vec::new(),
             strict: false,
         }
@@ -52,23 +52,23 @@ impl SemanticContext for Evidence<'_> {
         Ok(None)
     }
 
-    fn comparison_coercions(
+    fn operator_coercions(
         &self,
         occurrence: &Expr,
-    ) -> Result<Option<ComparisonCoercions<'_>>, CanonicalizeError> {
+    ) -> Result<Option<OperatorCoercions<'_>>, CanonicalizeError> {
         if let Some((_, coercions)) = self
-            .comparisons
+            .operators
             .iter()
             .find(|(node, _)| ptr::eq(*node, occurrence))
         {
-            return Ok(Some(ComparisonCoercions {
+            return Ok(Some(OperatorCoercions {
                 left: coercions.left,
                 right: coercions.right,
             }));
         }
         if self.strict {
             return Err(CanonicalizeError::Unsupported(
-                "foreign comparison occurrence".into(),
+                "foreign operator occurrence".into(),
             ));
         }
         Ok(None)
@@ -159,9 +159,9 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
     let source_context = Evidence {
         root: &source,
         columns: vec![(argument(operands(&source).0), reference(&["dm", "role"]))],
-        comparisons: vec![(
+        operators: vec![(
             &source,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: None,
                 right: Some(Conversion::Cast(&text)),
             },
@@ -172,9 +172,9 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
     let catalog_context = Evidence {
         root: &catalog,
         columns: vec![(argument(operands(&catalog).0), reference(&["dm", "role"]))],
-        comparisons: vec![(
+        operators: vec![(
             &catalog,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: None,
                 right: None,
             },
@@ -198,9 +198,9 @@ fn check_constraint_matches_postgresql_deparse_of_a_text_comparison() {
     };
     let text = data_type("TEXT");
     let declared_context = Evidence {
-        comparisons: vec![(
+        operators: vec![(
             &declared,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: None,
                 right: Some(Conversion::Cast(&text)),
             },
@@ -208,9 +208,9 @@ fn check_constraint_matches_postgresql_deparse_of_a_text_comparison() {
         ..Evidence::empty(&declared)
     };
     let deparsed_context = Evidence {
-        comparisons: vec![(
+        operators: vec![(
             deparsed_comparison,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: None,
                 right: None,
             },
@@ -220,6 +220,69 @@ fn check_constraint_matches_postgresql_deparse_of_a_text_comparison() {
     let declared = normalize(&declared_context).unwrap();
     assert_eq!(declared, "(s != CAST('' AS TEXT))");
     assert_eq!(declared, normalize(&deparsed_context).unwrap());
+}
+
+#[test]
+fn proved_postgresql_operators_match_their_deparse() {
+    for (declared, target, deparsed, canonical) in [
+        (
+            "s ~ '^[a-z]+$'",
+            "TEXT",
+            "(s ~ '^[a-z]+$'::TEXT)",
+            "(s ~ CAST('^[a-z]+$' AS TEXT))",
+        ),
+        (
+            "s ~~ 'a%'",
+            "TEXT",
+            "(s ~~ 'a%'::TEXT)",
+            "(s ~~ CAST('a%' AS TEXT))",
+        ),
+        (
+            "j ? 'k'",
+            "TEXT",
+            "(j ? 'k'::TEXT)",
+            "(j ? CAST('k' AS TEXT))",
+        ),
+        (
+            "j @> '{\"a\": 1}'",
+            "JSONB",
+            "(j @> '{\"a\": 1}'::JSONB)",
+            "(j @> CAST('{\"a\": 1}' AS JSONB))",
+        ),
+        (
+            "n + 1",
+            "NUMERIC",
+            "(n + (1)::NUMERIC)",
+            "(n + CAST(1 AS NUMERIC))",
+        ),
+    ] {
+        let target = data_type(target);
+        let declared = parse(declared);
+        let context = Evidence {
+            operators: vec![(
+                &declared,
+                OperatorCoercions {
+                    left: None,
+                    right: Some(Conversion::Cast(&target)),
+                },
+            )],
+            ..Evidence::empty(&declared)
+        };
+        let declared = normalize(&context).unwrap();
+        assert_eq!(declared, canonical);
+        let deparsed = parse(deparsed);
+        assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
+    }
+}
+
+#[test]
+fn boolean_connectives_are_never_asked_for_operand_conversions() {
+    let root = parse("TRUE AND (FALSE OR TRUE)");
+    let context = Evidence {
+        strict: true,
+        ..Evidence::empty(&root)
+    };
+    assert_eq!(normalize(&context).unwrap(), "(true AND (false OR true))");
 }
 
 /// Canonicalizes `declared` with `membership` proved for its root `IN` list and asserts that
@@ -248,7 +311,7 @@ fn compared<'a>(
     left: Option<Conversion<'a>>,
     right: Option<Conversion<'a>>,
 ) -> MembershipElement<'a> {
-    MembershipElement::Comparison(ComparisonCoercions { left, right })
+    MembershipElement::Comparison(OperatorCoercions { left, right })
 }
 
 const PLAIN_ARRAY: Option<ArrayCoercions<'static>> = Some(ArrayCoercions {
@@ -477,9 +540,9 @@ fn a_folded_literal_comparison_matches_its_deparse() {
     let declared = parse("i = '7'");
     let seven = parse("7");
     let context = Evidence {
-        comparisons: vec![(
+        operators: vec![(
             &declared,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: None,
                 right: Some(Conversion::Constant(&seven)),
             },
@@ -562,7 +625,7 @@ fn folding_a_column_into_a_constant_is_refused() {
     let fold = Some(Conversion::Constant(&one));
     for (left, right) in [(fold, None), (None, fold)] {
         let context = Evidence {
-            comparisons: vec![(&root, ComparisonCoercions { left, right })],
+            operators: vec![(&root, OperatorCoercions { left, right })],
             ..Evidence::empty(&root)
         };
         assert!(matches!(
@@ -591,9 +654,9 @@ fn deeply_parenthesized_folded_literals_do_not_exhaust_the_stack() {
     };
     let fold = |root, constant| {
         normalize(&Evidence {
-            comparisons: vec![(
+            operators: vec![(
                 root,
-                ComparisonCoercions {
+                OperatorCoercions {
                     left: None,
                     right: Some(Conversion::Constant(constant)),
                 },
@@ -638,9 +701,9 @@ fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
                 reference(&["paper_shares", "weight"]),
             ),
         ],
-        comparisons: vec![(
+        operators: vec![(
             &source,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: Some(Conversion::Cast(&numeric)),
                 right: None,
             },
@@ -657,9 +720,9 @@ fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
                 reference(&["paper_shares", "weight"]),
             ),
         ],
-        comparisons: vec![(
+        operators: vec![(
             &catalog,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: None,
                 right: None,
             },
@@ -714,9 +777,9 @@ fn qualified_type_and_typmod_survive_materialization() {
     let root = parse("weight > 0");
     let target = data_type("\"types\".\"Measure\"(12, 3)");
     let context = Evidence {
-        comparisons: vec![(
+        operators: vec![(
             &root,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: Some(Conversion::Cast(&target)),
                 right: None,
             },
@@ -734,9 +797,9 @@ fn materializing_a_coercion_keeps_an_existing_cast() {
     let root = parse("weight::INT > 0");
     let target = data_type("NUMERIC");
     let context = Evidence {
-        comparisons: vec![(
+        operators: vec![(
             &root,
-            ComparisonCoercions {
+            OperatorCoercions {
                 left: Some(Conversion::Cast(&target)),
                 right: None,
             },
@@ -799,7 +862,7 @@ fn schema_free_rendering_does_not_adopt_semantic_alias_elision() {
 #[test]
 fn provider_errors_are_not_silently_treated_as_missing_proofs() {
     for (sql, error) in [
-        ("weight > 0", "foreign comparison occurrence"),
+        ("weight > 0", "foreign operator occurrence"),
         ("weight IN (1, 2)", "foreign membership occurrence"),
     ] {
         let root = parse(sql);
