@@ -2,13 +2,56 @@ use sqlparser::ast::{DataType, Expr, Ident};
 
 use crate::CanonicalizeError;
 
-/// Explicit cast targets proved equivalent to a comparison's selected operand conversions.
+/// A proved conversion of one operand, as the server spells the converted operand.
+#[derive(Clone, Copy, Debug)]
+pub enum Conversion<'a> {
+    /// Spelled `CAST(operand AS target)`, with the target's proved qualification and typmod.
+    Cast(&'a DataType),
+    /// A literal operand the server converts when it reads the expression, spelled as the
+    /// constant it becomes, such as `1` for `'1'` compared with an `INTEGER`.
+    ///
+    /// The constant must be a literal or a cast of one, and only a literal operand takes it.
+    Constant(&'a Expr),
+}
+
+/// Proved conversions of a comparison's operands.
 #[derive(Clone, Copy, Debug)]
 pub struct ComparisonCoercions<'a> {
-    /// The left operand's cast target, including its proved qualification and typmod.
-    pub left: Option<&'a DataType>,
-    /// The right operand's cast target, including its proved qualification and typmod.
-    pub right: Option<&'a DataType>,
+    /// The left operand's conversion.
+    pub left: Option<Conversion<'a>>,
+    /// The right operand's conversion.
+    pub right: Option<Conversion<'a>>,
+}
+
+/// Proved conversions of the array comparison an `IN` list resolves to.
+#[derive(Clone, Copy, Debug)]
+pub struct ArrayCoercions<'a> {
+    /// The tested operand's conversion.
+    pub left: Option<Conversion<'a>>,
+    /// The cast target of the array built from the elements, such as `TEXT[]`.
+    pub array: Option<&'a DataType>,
+}
+
+/// How the server compares one element of an `IN` list with the tested operand.
+#[derive(Clone, Copy, Debug)]
+pub enum MembershipElement<'a> {
+    /// An element of the array the tested operand is compared with, with its conversion.
+    Array(Option<Conversion<'a>>),
+    /// An element compared on its own, as the comparison's right operand.
+    Comparison(ComparisonCoercions<'a>),
+}
+
+/// Proved resolution of an `IN` list into comparisons, as PostgreSQL resolves it.
+///
+/// `x IN (...)` becomes `x = ANY(ARRAY[...])` over the `Array` elements, followed by one
+/// `x = element` per `Comparison` element in list order, joined left to right by `OR`.
+/// `NOT IN` takes `!=`, `ALL` and `AND` instead.
+#[derive(Clone, Copy, Debug)]
+pub struct MembershipCoercions<'a> {
+    /// The array comparison, present exactly when some element is an `Array` element.
+    pub array: Option<ArrayCoercions<'a>>,
+    /// One resolution per list element, in list order.
+    pub elements: &'a [MembershipElement<'a>],
 }
 
 /// Authorizes semantic rendering operations on exact occurrences in one immutable expression.
@@ -28,11 +71,11 @@ pub trait SemanticContext {
     /// Returns an error for a foreign occurrence or unavailable required proof.
     fn column_reference(&self, occurrence: &Expr) -> Result<Option<&[Ident]>, CanonicalizeError>;
 
-    /// Returns explicit cast targets proved to preserve a resolved binary comparison.
+    /// Returns conversions proved to preserve a resolved binary comparison.
     ///
-    /// Each target must preserve the selected conversion's typmod, implicit-versus-explicit behavior,
-    /// and effective collation when emitted as `CAST`, including lookup of the supplied type spelling.
-    /// `None` grants no authorization, while two absent targets prove no materialization is needed.
+    /// Each conversion must preserve the selected conversion's typmod, implicit-versus-explicit
+    /// behavior, and effective collation as spelled, including lookup of a supplied type spelling.
+    /// `None` grants no authorization, while two absent conversions prove none is needed.
     /// Neither result authorizes reordering or removal of explicit casts.
     ///
     /// # Errors
@@ -41,4 +84,16 @@ pub trait SemanticContext {
         &self,
         occurrence: &Expr,
     ) -> Result<Option<ComparisonCoercions<'_>>, CanonicalizeError>;
+
+    /// Returns the proved resolution of an `IN` list occurrence into comparisons.
+    ///
+    /// Every comparison and conversion is bound by the same proof obligations as
+    /// [`comparison_coercions`](Self::comparison_coercions). `None` keeps the `IN` list as written.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign occurrence or unavailable required proof.
+    fn membership_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<MembershipCoercions<'_>>, CanonicalizeError>;
 }

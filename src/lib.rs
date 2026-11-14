@@ -11,7 +11,10 @@ mod canonicalize;
 mod semantic;
 
 pub use canonicalize::{Canonicalizer, hash_canonical};
-pub use semantic::{ComparisonCoercions, SemanticContext};
+pub use semantic::{
+    ArrayCoercions, ComparisonCoercions, Conversion, MembershipCoercions, MembershipElement,
+    SemanticContext,
+};
 
 /// Why a predicate could not be turned into canonical text.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
