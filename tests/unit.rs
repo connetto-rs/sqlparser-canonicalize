@@ -687,9 +687,28 @@ fn test_reject_unbalanced_square_bracket() {
 #[test]
 fn test_reject_uncanonicalizable_binary_operator() {
     assert_eq!(
-        unsupported_message("SELECT * FROM t WHERE a # b = 1"),
-        "Unsupported binary operator: #"
+        unsupported_message("SELECT * FROM t WHERE a <-> b = 1"),
+        "Unsupported binary operator: <->"
     );
+}
+
+/// Each PostgreSQL operator keeps its spelling and its written operand order, because none of
+/// them is symmetric for every type it is defined on.
+#[test]
+fn test_postgresql_operators_keep_written_order() {
+    let operators = [
+        "||", "|", "&", "^", "#", "<<", ">>", "&&", "~", "~*", "!~", "!~*", "~~", "~~*", "!~~",
+        "!~~*", "^@", "->", "->>", "#>", "#>>", "#-", "@>", "<@", "@?", "@@", "?", "?&", "?|",
+    ];
+    let predicates: Vec<(String, String)> = operators
+        .iter()
+        .map(|operator| (format!("z {operator} a"), format!("(z {operator} a)")))
+        .collect();
+    let cases: Vec<(&str, &str)> = predicates
+        .iter()
+        .map(|(predicate, canonical)| (predicate.as_str(), canonical.as_str()))
+        .collect();
+    assert_canonical(&PostgreSqlDialect {}, &cases);
 }
 
 #[test]

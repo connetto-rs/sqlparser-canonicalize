@@ -14,9 +14,9 @@ pub enum Conversion<'a> {
     Constant(&'a Expr),
 }
 
-/// Proved conversions of a comparison's operands.
+/// Proved conversions of a binary operator's operands.
 #[derive(Clone, Copy, Debug)]
-pub struct ComparisonCoercions<'a> {
+pub struct OperatorCoercions<'a> {
     /// The left operand's conversion.
     pub left: Option<Conversion<'a>>,
     /// The right operand's conversion.
@@ -38,7 +38,7 @@ pub enum MembershipElement<'a> {
     /// An element of the array the tested operand is compared with, with its conversion.
     Array(Option<Conversion<'a>>),
     /// An element compared on its own, as the comparison's right operand.
-    Comparison(ComparisonCoercions<'a>),
+    Comparison(OperatorCoercions<'a>),
 }
 
 /// Proved resolution of an `IN` list into comparisons, as PostgreSQL resolves it.
@@ -71,7 +71,8 @@ pub trait SemanticContext {
     /// Returns an error for a foreign occurrence or unavailable required proof.
     fn column_reference(&self, occurrence: &Expr) -> Result<Option<&[Ident]>, CanonicalizeError>;
 
-    /// Returns conversions proved to preserve a resolved binary comparison.
+    /// Returns conversions proved to preserve a resolved binary operator, asked for every binary
+    /// operation other than `AND` and `OR`.
     ///
     /// Each conversion must preserve the selected conversion's typmod, implicit-versus-explicit
     /// behavior, and effective collation as spelled, including lookup of a supplied type spelling.
@@ -80,15 +81,15 @@ pub trait SemanticContext {
     ///
     /// # Errors
     /// Returns an error for a foreign occurrence or unavailable required proof.
-    fn comparison_coercions(
+    fn operator_coercions(
         &self,
         occurrence: &Expr,
-    ) -> Result<Option<ComparisonCoercions<'_>>, CanonicalizeError>;
+    ) -> Result<Option<OperatorCoercions<'_>>, CanonicalizeError>;
 
     /// Returns the proved resolution of an `IN` list occurrence into comparisons.
     ///
     /// Every comparison and conversion is bound by the same proof obligations as
-    /// [`comparison_coercions`](Self::comparison_coercions). `None` keeps the `IN` list as written.
+    /// [`operator_coercions`](Self::operator_coercions). `None` keeps the `IN` list as written.
     ///
     /// # Errors
     /// Returns an error for a foreign occurrence or unavailable required proof.

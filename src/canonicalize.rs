@@ -443,25 +443,15 @@ fn normalize_expr_inner(
     let text = match expr {
         Expr::BinaryOp { left, op, right } => {
             if context.is_semantic() {
-                let coercions = if matches!(
-                    op,
-                    BinaryOperator::Eq
-                        | BinaryOperator::NotEq
-                        | BinaryOperator::Lt
-                        | BinaryOperator::Gt
-                        | BinaryOperator::LtEq
-                        | BinaryOperator::GtEq
-                        | BinaryOperator::Spaceship
-                        | BinaryOperator::Is
-                        | BinaryOperator::IsNot
-                ) {
+                let operator = operator_text(op)?;
+                let coercions = if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                    None
+                } else {
                     context
                         .evidence()
-                        .map(|evidence| evidence.comparison_coercions(expr))
+                        .map(|evidence| evidence.operator_coercions(expr))
                         .transpose()?
                         .flatten()
-                } else {
-                    None
                 };
                 let left = coerced_operand_text(
                     left,
@@ -477,7 +467,7 @@ fn normalize_expr_inner(
                     depth,
                     context,
                 )?;
-                format!("({left} {} {right})", operator_text(op)?)
+                format!("({left} {operator} {right})")
             } else if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                 let mut children = collect_flat_children(left, op);
                 children.extend(collect_flat_children(right, op));
@@ -2108,6 +2098,36 @@ fn operator_text(operator: &BinaryOperator) -> Result<&'static str, Canonicalize
         // SQLite also spells `IS NOT DISTINCT FROM` as `IS`, and `IS DISTINCT FROM` as `IS NOT`.
         BinaryOperator::Is => Ok("IS NOT DISTINCT FROM"),
         BinaryOperator::IsNot => Ok("IS DISTINCT FROM"),
+        BinaryOperator::StringConcat => Ok("||"),
+        BinaryOperator::BitwiseOr => Ok("|"),
+        BinaryOperator::BitwiseAnd => Ok("&"),
+        // PostgreSQL reads `^` as exponentiation and spells exclusive or `#`.
+        BinaryOperator::PGExp => Ok("^"),
+        BinaryOperator::PGBitwiseXor => Ok("#"),
+        BinaryOperator::PGBitwiseShiftLeft => Ok("<<"),
+        BinaryOperator::PGBitwiseShiftRight => Ok(">>"),
+        BinaryOperator::PGOverlap => Ok("&&"),
+        BinaryOperator::PGRegexMatch => Ok("~"),
+        BinaryOperator::PGRegexIMatch => Ok("~*"),
+        BinaryOperator::PGRegexNotMatch => Ok("!~"),
+        BinaryOperator::PGRegexNotIMatch => Ok("!~*"),
+        BinaryOperator::PGLikeMatch => Ok("~~"),
+        BinaryOperator::PGILikeMatch => Ok("~~*"),
+        BinaryOperator::PGNotLikeMatch => Ok("!~~"),
+        BinaryOperator::PGNotILikeMatch => Ok("!~~*"),
+        BinaryOperator::PGStartsWith => Ok("^@"),
+        BinaryOperator::Arrow => Ok("->"),
+        BinaryOperator::LongArrow => Ok("->>"),
+        BinaryOperator::HashArrow => Ok("#>"),
+        BinaryOperator::HashLongArrow => Ok("#>>"),
+        BinaryOperator::HashMinus => Ok("#-"),
+        BinaryOperator::AtArrow => Ok("@>"),
+        BinaryOperator::ArrowAt => Ok("<@"),
+        BinaryOperator::AtQuestion => Ok("@?"),
+        BinaryOperator::AtAt => Ok("@@"),
+        BinaryOperator::Question => Ok("?"),
+        BinaryOperator::QuestionAnd => Ok("?&"),
+        BinaryOperator::QuestionPipe => Ok("?|"),
         other => Err(CanonicalizeError::Unsupported(format!(
             "Unsupported binary operator: {other}"
         ))),
