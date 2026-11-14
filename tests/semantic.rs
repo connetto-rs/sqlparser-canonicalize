@@ -6,13 +6,15 @@ use sqlparser::ast::{
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser_canonicalize::{
-    CanonicalizeError, Canonicalizer, ComparisonCoercions, SemanticContext, hash_canonical,
+    ArrayCoercions, CanonicalizeError, Canonicalizer, ComparisonCoercions, Conversion,
+    MembershipCoercions, MembershipElement, SemanticContext, hash_canonical,
 };
 
 struct Evidence<'a> {
     root: &'a Expr,
     columns: Vec<(&'a Expr, Vec<Ident>)>,
     comparisons: Vec<(&'a Expr, ComparisonCoercions<'a>)>,
+    memberships: Vec<(&'a Expr, MembershipCoercions<'a>)>,
     strict: bool,
 }
 
@@ -22,6 +24,7 @@ impl<'a> Evidence<'a> {
             root,
             columns: Vec::new(),
             comparisons: Vec::new(),
+            memberships: Vec::new(),
             strict: false,
         }
     }
@@ -65,6 +68,25 @@ impl SemanticContext for Evidence<'_> {
         if self.strict {
             return Err(CanonicalizeError::Unsupported(
                 "foreign comparison occurrence".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn membership_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<MembershipCoercions<'_>>, CanonicalizeError> {
+        if let Some((_, membership)) = self
+            .memberships
+            .iter()
+            .find(|(node, _)| ptr::eq(*node, occurrence))
+        {
+            return Ok(Some(*membership));
+        }
+        if self.strict {
+            return Err(CanonicalizeError::Unsupported(
+                "foreign membership occurrence".into(),
             ));
         }
         Ok(None)
@@ -140,9 +162,10 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
             &source,
             ComparisonCoercions {
                 left: None,
-                right: Some(&text),
+                right: Some(Conversion::Cast(&text)),
             },
         )],
+        memberships: Vec::new(),
         strict: true,
     };
     let catalog_context = Evidence {
@@ -155,6 +178,7 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
                 right: None,
             },
         )],
+        memberships: Vec::new(),
         strict: true,
     };
     let source = normalize(&source_context).unwrap();
@@ -162,6 +186,347 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
     assert_eq!(source, "(lower(dm.role) = CAST('admin' AS TEXT))");
     assert_eq!(source, catalog);
     assert_eq!(hash_canonical(&source), hash_canonical(&catalog));
+}
+
+#[test]
+fn check_constraint_matches_postgresql_deparse_of_a_text_comparison() {
+    let declared = parse("s <> ''");
+    let deparsed = parse("(s <> ''::TEXT)");
+    let Expr::Nested(deparsed_comparison) = &deparsed else {
+        panic!("expected parenthesized comparison")
+    };
+    let text = data_type("TEXT");
+    let declared_context = Evidence {
+        comparisons: vec![(
+            &declared,
+            ComparisonCoercions {
+                left: None,
+                right: Some(Conversion::Cast(&text)),
+            },
+        )],
+        ..Evidence::empty(&declared)
+    };
+    let deparsed_context = Evidence {
+        comparisons: vec![(
+            deparsed_comparison,
+            ComparisonCoercions {
+                left: None,
+                right: None,
+            },
+        )],
+        ..Evidence::empty(&deparsed)
+    };
+    let declared = normalize(&declared_context).unwrap();
+    assert_eq!(declared, "(s != CAST('' AS TEXT))");
+    assert_eq!(declared, normalize(&deparsed_context).unwrap());
+}
+
+/// Canonicalizes `declared` with `membership` proved for its root `IN` list and asserts that
+/// PostgreSQL's deparse of it, read without any proof, has the same canonical text.
+fn reconcile_membership(
+    declared: &str,
+    membership: MembershipCoercions<'_>,
+    deparsed: &str,
+) -> String {
+    let declared = parse(declared);
+    let context = Evidence {
+        memberships: vec![(&declared, membership)],
+        ..Evidence::empty(&declared)
+    };
+    let canonical = normalize(&context).unwrap();
+    let deparsed = parse(deparsed);
+    assert_eq!(canonical, normalize(&Evidence::empty(&deparsed)).unwrap());
+    canonical
+}
+
+fn in_array(conversion: Option<Conversion<'_>>) -> MembershipElement<'_> {
+    MembershipElement::Array(conversion)
+}
+
+fn compared<'a>(
+    left: Option<Conversion<'a>>,
+    right: Option<Conversion<'a>>,
+) -> MembershipElement<'a> {
+    MembershipElement::Comparison(ComparisonCoercions { left, right })
+}
+
+const PLAIN_ARRAY: Option<ArrayCoercions<'static>> = Some(ArrayCoercions {
+    left: None,
+    array: None,
+});
+
+#[test]
+fn proved_in_lists_match_postgresql_array_comparisons() {
+    let text = data_type("TEXT");
+    let varchar = data_type("CHARACTER VARYING");
+    let text_array = data_type("TEXT[]");
+    let bpchar = data_type("bpchar");
+    let (one, two, minus_one) = (parse("1"), parse("2"), parse("'-1'::INTEGER"));
+    let to_text = Some(Conversion::Cast(&text));
+    let text_pair = [in_array(to_text), in_array(to_text)];
+
+    assert_eq!(
+        reconcile_membership(
+            "s IN ('a', 'b')",
+            MembershipCoercions {
+                array: PLAIN_ARRAY,
+                elements: &text_pair,
+            },
+            "(s = ANY (ARRAY['a'::text, 'b'::text]))",
+        ),
+        "s = ANY(ARRAY[CAST('a' AS TEXT), CAST('b' AS TEXT)])"
+    );
+    assert_eq!(
+        reconcile_membership(
+            "s NOT IN ('a', 'b')",
+            MembershipCoercions {
+                array: PLAIN_ARRAY,
+                elements: &text_pair,
+            },
+            "(s <> ALL (ARRAY['a'::text, 'b'::text]))",
+        ),
+        "s != ALL(ARRAY[CAST('a' AS TEXT), CAST('b' AS TEXT)])"
+    );
+    let to_varchar = Some(Conversion::Cast(&varchar));
+    assert_eq!(
+        reconcile_membership(
+            "v IN ('a', 'b')",
+            MembershipCoercions {
+                array: Some(ArrayCoercions {
+                    left: to_text,
+                    array: Some(&text_array),
+                }),
+                elements: &[in_array(to_varchar), in_array(to_varchar)],
+            },
+            "((v)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[]))",
+        ),
+        "CAST(v AS TEXT) = ANY(CAST(ARRAY[CAST('a' AS CHARACTER VARYING), CAST('b' AS CHARACTER VARYING)] AS TEXT[]))"
+    );
+    let to_bpchar = Some(Conversion::Cast(&bpchar));
+    reconcile_membership(
+        "c IN ('a', 'b')",
+        MembershipCoercions {
+            array: PLAIN_ARRAY,
+            elements: &[in_array(to_bpchar), in_array(to_bpchar)],
+        },
+        "(c = ANY (ARRAY['a'::bpchar, 'b'::bpchar]))",
+    );
+    reconcile_membership(
+        "s IN ('a', 'b', NULL)",
+        MembershipCoercions {
+            array: PLAIN_ARRAY,
+            elements: &[in_array(to_text), in_array(to_text), in_array(to_text)],
+        },
+        "(s = ANY (ARRAY['a'::text, 'b'::text, NULL::text]))",
+    );
+    assert_eq!(
+        reconcile_membership(
+            "i IN (1, 2)",
+            MembershipCoercions {
+                array: PLAIN_ARRAY,
+                elements: &[in_array(None), in_array(None)],
+            },
+            "(i = ANY (ARRAY[1, 2]))",
+        ),
+        "i = ANY(ARRAY[1, 2])"
+    );
+    reconcile_membership(
+        "i IN ('1', '2')",
+        MembershipCoercions {
+            array: PLAIN_ARRAY,
+            elements: &[
+                in_array(Some(Conversion::Constant(&one))),
+                in_array(Some(Conversion::Constant(&two))),
+            ],
+        },
+        "(i = ANY (ARRAY[1, 2]))",
+    );
+    assert_eq!(
+        reconcile_membership(
+            "i IN (-1, 2)",
+            MembershipCoercions {
+                array: PLAIN_ARRAY,
+                elements: &[
+                    in_array(Some(Conversion::Constant(&minus_one))),
+                    in_array(None)
+                ],
+            },
+            "(i = ANY (ARRAY['-1'::integer, 2]))",
+        ),
+        "i = ANY(ARRAY[CAST('-1' AS INTEGER), 2])"
+    );
+}
+
+#[test]
+fn proved_in_lists_match_postgresql_comparison_chains() {
+    let text = data_type("TEXT");
+    let seven = parse("7");
+    let to_text = Some(Conversion::Cast(&text));
+    assert_eq!(
+        reconcile_membership(
+            "s IN ('a')",
+            MembershipCoercions {
+                array: None,
+                elements: &[compared(None, to_text)],
+            },
+            "(s = 'a'::text)",
+        ),
+        "(s = CAST('a' AS TEXT))"
+    );
+    reconcile_membership(
+        "i IN ('7')",
+        MembershipCoercions {
+            array: None,
+            elements: &[compared(None, Some(Conversion::Constant(&seven)))],
+        },
+        "(i = 7)",
+    );
+    assert_eq!(
+        reconcile_membership(
+            "s IN ('a', u, w)",
+            MembershipCoercions {
+                array: None,
+                elements: &[
+                    compared(None, to_text),
+                    compared(None, None),
+                    compared(None, None)
+                ],
+            },
+            "(((s = 'a'::text) OR (s = u)) OR (s = w))",
+        ),
+        "(((s = CAST('a' AS TEXT)) OR (s = u)) OR (s = w))"
+    );
+    assert_eq!(
+        reconcile_membership(
+            "s IN ('a', 'b', u, 'c', w)",
+            MembershipCoercions {
+                array: PLAIN_ARRAY,
+                elements: &[
+                    in_array(to_text),
+                    in_array(to_text),
+                    compared(None, None),
+                    in_array(to_text),
+                    compared(None, None),
+                ],
+            },
+            "(((s = ANY (ARRAY['a'::text, 'b'::text, 'c'::text])) OR (s = u)) OR (s = w))",
+        ),
+        "(((s = ANY(ARRAY[CAST('a' AS TEXT), CAST('b' AS TEXT), CAST('c' AS TEXT)])) OR (s = u)) OR (s = w))"
+    );
+    assert_eq!(
+        reconcile_membership(
+            "s NOT IN ('a', u)",
+            MembershipCoercions {
+                array: None,
+                elements: &[compared(None, to_text), compared(None, None)],
+            },
+            "((s <> 'a'::text) AND (s <> u))",
+        ),
+        "((s != CAST('a' AS TEXT)) AND (s != u))"
+    );
+    assert_eq!(
+        reconcile_membership(
+            "v IN ('a', u)",
+            MembershipCoercions {
+                array: None,
+                elements: &[compared(to_text, to_text), compared(to_text, None)],
+            },
+            "(((v)::text = 'a'::text) OR ((v)::text = u))",
+        ),
+        "((CAST(v AS TEXT) = CAST('a' AS TEXT)) OR (CAST(v AS TEXT) = u))"
+    );
+    reconcile_membership(
+        "i IN (j, 1)",
+        MembershipCoercions {
+            array: None,
+            elements: &[compared(None, None), compared(None, None)],
+        },
+        "((i = j) OR (i = 1))",
+    );
+}
+
+#[test]
+fn a_proved_in_list_nested_in_a_check_keeps_the_deparsed_grouping() {
+    let text = data_type("TEXT");
+    let to_text = Some(Conversion::Cast(&text));
+    let elements = [in_array(to_text), in_array(to_text)];
+    let declared = parse("v > 0 AND s IN ('a', 'b')");
+    let (_, membership) = operands(&declared);
+    let context = Evidence {
+        memberships: vec![(
+            membership,
+            MembershipCoercions {
+                array: PLAIN_ARRAY,
+                elements: &elements,
+            },
+        )],
+        ..Evidence::empty(&declared)
+    };
+    let deparsed = parse("((v > 0) AND (s = ANY (ARRAY['a'::text, 'b'::text])))");
+    let declared = normalize(&context).unwrap();
+    assert_eq!(
+        declared,
+        "((v > 0) AND (s = ANY(ARRAY[CAST('a' AS TEXT), CAST('b' AS TEXT)])))"
+    );
+    assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
+}
+
+#[test]
+fn a_folded_literal_comparison_matches_its_deparse() {
+    let declared = parse("i = '7'");
+    let seven = parse("7");
+    let context = Evidence {
+        comparisons: vec![(
+            &declared,
+            ComparisonCoercions {
+                left: None,
+                right: Some(Conversion::Constant(&seven)),
+            },
+        )],
+        ..Evidence::empty(&declared)
+    };
+    let deparsed = parse("(i = 7)");
+    let declared = normalize(&context).unwrap();
+    assert_eq!(declared, "(i = 7)");
+    assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
+}
+
+#[test]
+fn inconsistent_membership_proofs_are_refused() {
+    let text = data_type("TEXT");
+    let one = parse("1");
+    let to_text = Some(Conversion::Cast(&text));
+    let root = parse("s IN ('a', u)");
+    for membership in [
+        MembershipCoercions {
+            array: None,
+            elements: &[compared(None, to_text)],
+        },
+        MembershipCoercions {
+            array: None,
+            elements: &[in_array(to_text), compared(None, None)],
+        },
+        MembershipCoercions {
+            array: PLAIN_ARRAY,
+            elements: &[compared(None, to_text), compared(None, None)],
+        },
+        MembershipCoercions {
+            array: None,
+            elements: &[
+                compared(None, to_text),
+                compared(None, Some(Conversion::Constant(&one))),
+            ],
+        },
+    ] {
+        let context = Evidence {
+            memberships: vec![(&root, membership)],
+            ..Evidence::empty(&root)
+        };
+        assert!(matches!(
+            normalize(&context),
+            Err(CanonicalizeError::Unsupported(_))
+        ));
+    }
 }
 
 #[test]
@@ -195,10 +560,11 @@ fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
         comparisons: vec![(
             &source,
             ComparisonCoercions {
-                left: Some(&numeric),
+                left: Some(Conversion::Cast(&numeric)),
                 right: None,
             },
         )],
+        memberships: Vec::new(),
         strict: true,
     };
     let catalog_context = Evidence {
@@ -217,6 +583,7 @@ fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
                 right: None,
             },
         )],
+        memberships: Vec::new(),
         strict: true,
     };
     let source = normalize(&source_context).unwrap();
@@ -269,7 +636,7 @@ fn qualified_type_and_typmod_survive_materialization() {
         comparisons: vec![(
             &root,
             ComparisonCoercions {
-                left: Some(&target),
+                left: Some(Conversion::Cast(&target)),
                 right: None,
             },
         )],
@@ -289,7 +656,7 @@ fn materializing_a_coercion_keeps_an_existing_cast() {
         comparisons: vec![(
             &root,
             ComparisonCoercions {
-                left: Some(&target),
+                left: Some(Conversion::Cast(&target)),
                 right: None,
             },
         )],
@@ -350,17 +717,20 @@ fn schema_free_rendering_does_not_adopt_semantic_alias_elision() {
 
 #[test]
 fn provider_errors_are_not_silently_treated_as_missing_proofs() {
-    let root = parse("weight > 0");
-    let context = Evidence {
-        strict: true,
-        ..Evidence::empty(&root)
-    };
-    assert_eq!(
-        normalize(&context),
-        Err(CanonicalizeError::Unsupported(
-            "foreign comparison occurrence".into()
-        ))
-    );
+    for (sql, error) in [
+        ("weight > 0", "foreign comparison occurrence"),
+        ("weight IN (1, 2)", "foreign membership occurrence"),
+    ] {
+        let root = parse(sql);
+        let context = Evidence {
+            strict: true,
+            ..Evidence::empty(&root)
+        };
+        assert_eq!(
+            normalize(&context),
+            Err(CanonicalizeError::Unsupported(error.into()))
+        );
+    }
 }
 
 #[test]

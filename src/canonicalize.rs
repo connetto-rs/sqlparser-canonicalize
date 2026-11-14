@@ -7,7 +7,7 @@ use core::hash::{Hash, Hasher};
 
 use seahash::SeaHasher;
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DataType, DateTimeField, Distinct, Expr,
+    AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DateTimeField, Distinct, Expr,
     ExtractSyntax, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     InTarget, Interval, LimitClause, ObjectName, Query, Select, SelectItem, SelectModifiers,
     SetExpr, Statement, Subscript, TableAlias, TableFactor, TableInheritance, UnaryOperator, Value,
@@ -17,7 +17,9 @@ use sqlparser::keywords::ALL_KEYWORDS;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use crate::{CanonicalizeError, SemanticContext};
+use crate::{
+    CanonicalizeError, Conversion, MembershipCoercions, MembershipElement, SemanticContext,
+};
 
 const MAX_EXPR_DEPTH: usize = 128;
 const MAX_SQL_LEN: usize = 8192;
@@ -77,7 +79,8 @@ impl<'a> Canonicalizer<'a> {
         confirm_reads_back_as_itself(canonical, &context)
     }
 
-    /// Renders an expression using authorized original-occurrence rewrites without reordering operations.
+    /// Renders an expression using authorized original-occurrence rewrites without reordering
+    /// operations other than a proved `IN` list resolution.
     ///
     /// The expression must use this canonicalizer's dialect and execute in the provider's proved scope.
     ///
@@ -419,6 +422,24 @@ fn normalize_expr_inner(
         return qualified_name_text(parts.iter(), NamePlace::Operand, context);
     }
 
+    if let Expr::In {
+        expr: subject,
+        target: InTarget::List(list),
+        negated,
+        global: false,
+    } = expr
+        && let Some(evidence) = context.evidence()
+        && let Some(membership) = evidence.membership_coercions(expr)?
+    {
+        let (text, encloses) =
+            membership_text(subject, list, *negated, &membership, depth, context)?;
+        return Ok(if tight_parent && !encloses {
+            format!("({text})")
+        } else {
+            text
+        });
+    }
+
     let text = match expr {
         Expr::BinaryOp { left, op, right } => {
             if context.is_semantic() {
@@ -442,10 +463,20 @@ fn normalize_expr_inner(
                 } else {
                     None
                 };
-                let left =
-                    coerced_operand_text(left, coercions.and_then(|c| c.left), depth, context)?;
-                let right =
-                    coerced_operand_text(right, coercions.and_then(|c| c.right), depth, context)?;
+                let left = coerced_operand_text(
+                    left,
+                    coercions.and_then(|c| c.left),
+                    true,
+                    depth,
+                    context,
+                )?;
+                let right = coerced_operand_text(
+                    right,
+                    coercions.and_then(|c| c.right),
+                    true,
+                    depth,
+                    context,
+                )?;
                 format!("({left} {} {right})", operator_text(op)?)
             } else if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                 let mut children = collect_flat_children(left, op);
@@ -935,17 +966,103 @@ fn normalize_expr_inner(
     })
 }
 
+/// Spells an operand under its proved conversion. `tight` encloses an operand left as written
+/// or a constant that does not enclose itself.
 fn coerced_operand_text(
     expr: &Expr,
-    target: Option<&DataType>,
+    conversion: Option<Conversion<'_>>,
+    tight: bool,
     depth: usize,
     context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
-    let text = normalize_expr_inner(expr, depth + 1, target.is_none(), context)?;
-    Ok(match target {
-        Some(target) => format!("CAST({text} AS {target})"),
-        None => text,
-    })
+    match conversion {
+        None => normalize_expr_inner(expr, depth + 1, tight, context),
+        Some(Conversion::Cast(target)) => Ok(format!(
+            "CAST({} AS {target})",
+            normalize_expr_inner(expr, depth + 1, false, context)?
+        )),
+        Some(Conversion::Constant(constant)) => {
+            let is_constant = match constant {
+                Expr::Cast { expr, .. } => is_literal(expr, context),
+                constant => is_literal(constant, context),
+            };
+            if !is_literal(expr, context) || !is_constant {
+                return Err(CanonicalizeError::Unsupported(
+                    "Only a literal converts to a constant, which must be a literal or a cast of one"
+                        .to_string(),
+                ));
+            }
+            normalize_expr_inner(constant, depth + 1, tight, context)
+        }
+    }
+}
+
+/// Spells an `IN` list as the proved array comparison and element comparisons it resolves to,
+/// and reports whether the text encloses itself.
+fn membership_text(
+    subject: &Expr,
+    list: &[Expr],
+    negated: bool,
+    membership: &MembershipCoercions<'_>,
+    depth: usize,
+    context: &RenderContext<'_>,
+) -> Result<(String, bool), CanonicalizeError> {
+    let inconsistent = |reason: &str| CanonicalizeError::Unsupported(reason.to_string());
+    if membership.elements.len() != list.len() {
+        return Err(inconsistent(
+            "A membership proof must resolve every list element",
+        ));
+    }
+    let (operator, quantifier, joiner) = if negated {
+        (BinaryOperator::NotEq, "ALL", BinaryOperator::And)
+    } else {
+        (BinaryOperator::Eq, "ANY", BinaryOperator::Or)
+    };
+    let operator = operator_text(&operator)?;
+    let joiner = operator_text(&joiner)?;
+    let mut array = Vec::new();
+    let mut comparisons = Vec::new();
+    for (element, resolution) in list.iter().zip(membership.elements) {
+        match *resolution {
+            MembershipElement::Array(conversion) => {
+                array.push(coerced_operand_text(
+                    element, conversion, false, depth, context,
+                )?);
+            }
+            MembershipElement::Comparison(coercions) => {
+                let left = coerced_operand_text(subject, coercions.left, true, depth, context)?;
+                let right = coerced_operand_text(element, coercions.right, true, depth, context)?;
+                comparisons.push(format!("({left} {operator} {right})"));
+            }
+        }
+    }
+    let mut comparisons = comparisons.into_iter();
+    let mut text = match (membership.array, array.is_empty()) {
+        (Some(coercions), false) => {
+            let left = coerced_operand_text(subject, coercions.left, true, depth, context)?;
+            let mut elements = format!("ARRAY[{}]", array.join(", "));
+            if let Some(target) = coercions.array {
+                elements = format!("CAST({elements} AS {target})");
+            }
+            let comparison = format!("{left} {operator} {quantifier}({elements})");
+            if comparisons.as_slice().is_empty() {
+                return Ok((comparison, false));
+            }
+            format!("({comparison})")
+        }
+        (None, true) => comparisons
+            .next()
+            .ok_or_else(|| inconsistent("An empty IN list resolves to no comparison"))?,
+        _ => {
+            return Err(inconsistent(
+                "A membership proof must have an array comparison exactly when an element is in the array",
+            ));
+        }
+    };
+    for comparison in comparisons {
+        text = format!("({text} {joiner} {comparison})");
+    }
+    Ok((text, true))
 }
 
 /// How a binary operator treats the order of its operands.
