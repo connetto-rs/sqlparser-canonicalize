@@ -18,7 +18,8 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use crate::{
-    CanonicalizeError, Conversion, MembershipCoercions, MembershipElement, SemanticContext,
+    CanonicalizeError, Conversion, MembershipCoercions, MembershipElement, PatternCoercions,
+    SemanticContext,
 };
 
 const MAX_EXPR_DEPTH: usize = 128;
@@ -438,6 +439,65 @@ fn normalize_expr_inner(
         } else {
             text
         });
+    }
+
+    if let Expr::Like {
+        negated,
+        any,
+        expr: subject,
+        pattern,
+        escape_char: escape,
+    }
+    | Expr::ILike {
+        negated,
+        any,
+        expr: subject,
+        pattern,
+        escape_char: escape,
+    } = expr
+        && let Some(evidence) = context.evidence()
+        && let Some(coercions) = evidence.pattern_coercions(expr)?
+    {
+        if *any {
+            return Err(CanonicalizeError::Unsupported(
+                "LIKE ANY has no PostgreSQL operator form".to_string(),
+            ));
+        }
+        let operator = match (matches!(expr, Expr::Like { .. }), *negated) {
+            (true, false) => "~~",
+            (true, true) => "!~~",
+            (false, false) => "~~*",
+            (false, true) => "!~~*",
+        };
+        let shape = PatternShape {
+            subject,
+            operator,
+            pattern,
+            escape: escape.as_deref(),
+            escape_function: "like_escape",
+            always_escaped: false,
+        };
+        return pattern_text(&shape, &coercions, depth, context);
+    }
+
+    if let Expr::SimilarTo {
+        negated,
+        expr: subject,
+        pattern,
+        escape_char: escape,
+    } = expr
+        && let Some(evidence) = context.evidence()
+        && let Some(coercions) = evidence.pattern_coercions(expr)?
+    {
+        let shape = PatternShape {
+            subject,
+            operator: if *negated { "!~" } else { "~" },
+            pattern,
+            escape: escape.as_deref(),
+            escape_function: "similar_to_escape",
+            always_escaped: true,
+        };
+        return pattern_text(&shape, &coercions, depth, context);
     }
 
     let text = match expr {
@@ -1053,6 +1113,45 @@ fn membership_text(
         text = format!("({text} {joiner} {comparison})");
     }
     Ok((text, true))
+}
+
+/// The parts of a `LIKE`, `ILIKE` or `SIMILAR TO` match spelled as the operator PostgreSQL
+/// stores.
+struct PatternShape<'e> {
+    subject: &'e Expr,
+    operator: &'static str,
+    pattern: &'e Expr,
+    escape: Option<&'e Expr>,
+    /// The function PostgreSQL wraps the pattern in, `like_escape` or `similar_to_escape`.
+    escape_function: &'static str,
+    /// Whether the pattern is wrapped even without an `ESCAPE` clause, as `SIMILAR TO` is.
+    always_escaped: bool,
+}
+
+/// Spells a proved pattern match as `(subject operator pattern)`, with the pattern wrapped in
+/// the escape function where PostgreSQL wraps it.
+fn pattern_text(
+    shape: &PatternShape<'_>,
+    coercions: &PatternCoercions<'_>,
+    depth: usize,
+    context: &RenderContext<'_>,
+) -> Result<String, CanonicalizeError> {
+    let subject = coerced_operand_text(shape.subject, coercions.subject, true, depth, context)?;
+    let pattern = coerced_operand_text(shape.pattern, coercions.pattern, true, depth, context)?;
+    let right = match (shape.escape, coercions.escape) {
+        (Some(escape), conversion) => {
+            let escape = coerced_operand_text(escape, conversion, true, depth, context)?;
+            format!("{}({pattern}, {escape})", shape.escape_function)
+        }
+        (None, Some(_)) => {
+            return Err(CanonicalizeError::Unsupported(
+                "A pattern proof converts an escape the match does not have".to_string(),
+            ));
+        }
+        (None, None) if shape.always_escaped => format!("{}({pattern})", shape.escape_function),
+        (None, None) => pattern,
+    };
+    Ok(format!("({subject} {} {right})", shape.operator))
 }
 
 /// How a binary operator treats the order of its operands.
