@@ -54,6 +54,24 @@ pub struct MembershipCoercions<'a> {
     pub elements: &'a [MembershipElement<'a>],
 }
 
+/// Proved conversions of a `LIKE`, `ILIKE` or `SIMILAR TO` match, applied where PostgreSQL
+/// applies them.
+///
+/// The match takes the operator PostgreSQL stores, `~~`, `!~~`, `~~*` or `!~~*` for the `LIKE`
+/// family and `~` or `!~` for `SIMILAR TO`. An `ESCAPE` clause makes the right operand
+/// `like_escape(pattern, escape)`, and `SIMILAR TO` always makes it
+/// `similar_to_escape(pattern[, escape])`, so there `pattern` and `escape` convert that
+/// function's arguments.
+#[derive(Clone, Copy, Debug)]
+pub struct PatternCoercions<'a> {
+    /// The matched operand's conversion.
+    pub subject: Option<Conversion<'a>>,
+    /// The pattern's conversion.
+    pub pattern: Option<Conversion<'a>>,
+    /// The escape character's conversion, present only when the match has an `ESCAPE` clause.
+    pub escape: Option<Conversion<'a>>,
+}
+
 /// Authorizes semantic rendering operations on exact occurrences in one immutable expression.
 ///
 /// Implementations own the semantic proof, including resolved operation and conversion identities,
@@ -97,4 +115,17 @@ pub trait SemanticContext {
         &self,
         occurrence: &Expr,
     ) -> Result<Option<MembershipCoercions<'_>>, CanonicalizeError>;
+
+    /// Returns the proved conversions of a `LIKE`, `ILIKE` or `SIMILAR TO` occurrence, which is
+    /// then spelled as the operator PostgreSQL stores.
+    ///
+    /// Every conversion is bound by the same proof obligations as
+    /// [`operator_coercions`](Self::operator_coercions). `None` keeps the match as written.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign occurrence or unavailable required proof.
+    fn pattern_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<PatternCoercions<'_>>, CanonicalizeError>;
 }

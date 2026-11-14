@@ -8,7 +8,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser_canonicalize::{
     ArrayCoercions, CanonicalizeError, Canonicalizer, Conversion, MembershipCoercions,
-    MembershipElement, OperatorCoercions, SemanticContext, hash_canonical,
+    MembershipElement, OperatorCoercions, PatternCoercions, SemanticContext, hash_canonical,
 };
 
 struct Evidence<'a> {
@@ -16,6 +16,7 @@ struct Evidence<'a> {
     columns: Vec<(&'a Expr, Vec<Ident>)>,
     operators: Vec<(&'a Expr, OperatorCoercions<'a>)>,
     memberships: Vec<(&'a Expr, MembershipCoercions<'a>)>,
+    patterns: Vec<(&'a Expr, PatternCoercions<'a>)>,
     strict: bool,
 }
 
@@ -26,6 +27,7 @@ impl<'a> Evidence<'a> {
             columns: Vec::new(),
             operators: Vec::new(),
             memberships: Vec::new(),
+            patterns: Vec::new(),
             strict: false,
         }
     }
@@ -88,6 +90,25 @@ impl SemanticContext for Evidence<'_> {
         if self.strict {
             return Err(CanonicalizeError::Unsupported(
                 "foreign membership occurrence".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn pattern_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<PatternCoercions<'_>>, CanonicalizeError> {
+        if let Some((_, pattern)) = self
+            .patterns
+            .iter()
+            .find(|(node, _)| ptr::eq(*node, occurrence))
+        {
+            return Ok(Some(*pattern));
+        }
+        if self.strict {
+            return Err(CanonicalizeError::Unsupported(
+                "foreign pattern occurrence".into(),
             ));
         }
         Ok(None)
@@ -167,6 +188,7 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
             },
         )],
         memberships: Vec::new(),
+        patterns: Vec::new(),
         strict: true,
     };
     let catalog_context = Evidence {
@@ -180,6 +202,7 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
             },
         )],
         memberships: Vec::new(),
+        patterns: Vec::new(),
         strict: true,
     };
     let source = normalize(&source_context).unwrap();
@@ -272,6 +295,152 @@ fn proved_postgresql_operators_match_their_deparse() {
         assert_eq!(declared, canonical);
         let deparsed = parse(deparsed);
         assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
+    }
+}
+
+#[test]
+fn proved_pattern_matches_take_the_operators_postgresql_stores() {
+    let text = data_type("TEXT");
+    let to_text = Some(Conversion::Cast(&text));
+    let pattern = PatternCoercions {
+        subject: None,
+        pattern: to_text,
+        escape: None,
+    };
+    let escaped = PatternCoercions {
+        escape: to_text,
+        ..pattern
+    };
+    let varchar = PatternCoercions {
+        subject: to_text,
+        ..pattern
+    };
+    for (declared, proof, deparsed, canonical) in [
+        (
+            "s LIKE 'a%'",
+            pattern,
+            "(s ~~ 'a%'::text)",
+            "(s ~~ CAST('a%' AS TEXT))",
+        ),
+        (
+            "s NOT LIKE 'a%'",
+            pattern,
+            "(s !~~ 'a%'::text)",
+            "(s !~~ CAST('a%' AS TEXT))",
+        ),
+        (
+            "s ILIKE 'a%'",
+            pattern,
+            "(s ~~* 'a%'::text)",
+            "(s ~~* CAST('a%' AS TEXT))",
+        ),
+        (
+            "s NOT ILIKE 'a%'",
+            pattern,
+            "(s !~~* 'a%'::text)",
+            "(s !~~* CAST('a%' AS TEXT))",
+        ),
+        (
+            "s LIKE 'a%' ESCAPE '#'",
+            escaped,
+            "(s ~~ like_escape('a%'::text, '#'::text))",
+            "(s ~~ like_escape(CAST('a%' AS TEXT), CAST('#' AS TEXT)))",
+        ),
+        (
+            "s SIMILAR TO 'a%'",
+            pattern,
+            "(s ~ similar_to_escape('a%'::text))",
+            "(s ~ similar_to_escape(CAST('a%' AS TEXT)))",
+        ),
+        (
+            "s NOT SIMILAR TO 'a%' ESCAPE '#'",
+            escaped,
+            "(s !~ similar_to_escape('a%'::text, '#'::text))",
+            "(s !~ similar_to_escape(CAST('a%' AS TEXT), CAST('#' AS TEXT)))",
+        ),
+        (
+            "vc LIKE 'a%'",
+            varchar,
+            "((vc)::text ~~ 'a%'::text)",
+            "(CAST(vc AS TEXT) ~~ CAST('a%' AS TEXT))",
+        ),
+        (
+            "s LIKE vc",
+            pattern,
+            "(s ~~ (vc)::text)",
+            "(s ~~ CAST(vc AS TEXT))",
+        ),
+    ] {
+        let declared = parse(declared);
+        let context = Evidence {
+            patterns: vec![(&declared, proof)],
+            ..Evidence::empty(&declared)
+        };
+        let declared = normalize(&context).unwrap();
+        assert_eq!(declared, canonical);
+        let deparsed = parse(deparsed);
+        assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
+    }
+}
+
+#[test]
+fn a_proved_pattern_match_nested_in_a_check_keeps_its_grouping() {
+    let text = data_type("TEXT");
+    let declared = parse("NOT s LIKE 'a%' AND s LIKE 'b%'");
+    let Expr::BinaryOp { left, right, .. } = &declared else {
+        panic!("expected conjunction")
+    };
+    let Expr::UnaryOp { expr: negated, .. } = left.as_ref() else {
+        panic!("expected negation")
+    };
+    let proof = PatternCoercions {
+        subject: None,
+        pattern: Some(Conversion::Cast(&text)),
+        escape: None,
+    };
+    let context = Evidence {
+        patterns: vec![(negated, proof), (right, proof)],
+        ..Evidence::empty(&declared)
+    };
+    let deparsed = parse("((NOT (s ~~ 'a%'::text)) AND (s ~~ 'b%'::text))");
+    let declared = normalize(&context).unwrap();
+    assert_eq!(
+        declared,
+        "((NOT (s ~~ CAST('a%' AS TEXT))) AND (s ~~ CAST('b%' AS TEXT)))"
+    );
+    assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
+}
+
+#[test]
+fn inconsistent_pattern_proofs_are_refused() {
+    let text = data_type("TEXT");
+    let escape_without_clause = PatternCoercions {
+        subject: None,
+        pattern: None,
+        escape: Some(Conversion::Cast(&text)),
+    };
+    let plain = PatternCoercions {
+        escape: None,
+        ..escape_without_clause
+    };
+    for (sql, proof) in [
+        ("s LIKE 'a%'", escape_without_clause),
+        ("s SIMILAR TO 'a%'", escape_without_clause),
+        ("s LIKE ANY ('a%', 'b%')", plain),
+    ] {
+        let root = Parser::new(&sqlparser::dialect::SnowflakeDialect {})
+            .try_with_sql(sql)
+            .unwrap()
+            .parse_expr()
+            .unwrap();
+        let context = Evidence {
+            patterns: vec![(&root, proof)],
+            ..Evidence::empty(&root)
+        };
+        assert!(matches!(
+            normalize(&context),
+            Err(CanonicalizeError::Unsupported(_))
+        ));
     }
 }
 
@@ -709,6 +878,7 @@ fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
             },
         )],
         memberships: Vec::new(),
+        patterns: Vec::new(),
         strict: true,
     };
     let catalog_context = Evidence {
@@ -728,6 +898,7 @@ fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
             },
         )],
         memberships: Vec::new(),
+        patterns: Vec::new(),
         strict: true,
     };
     let source = normalize(&source_context).unwrap();
