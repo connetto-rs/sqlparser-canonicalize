@@ -3,14 +3,21 @@ use sqlparser::ast::{DataType, Expr, Ident};
 use crate::CanonicalizeError;
 
 /// A proved conversion of one operand, as the server spells the converted operand.
+///
+/// The conversion applies under the operand's `COLLATE` clauses, as PostgreSQL applies it.
 #[derive(Clone, Copy, Debug)]
 pub enum Conversion<'a> {
     /// Spelled `CAST(operand AS target)`, with the target's proved qualification and typmod.
+    ///
+    /// A collated operand keeps its collation, so `'a' COLLATE "C"` cast to `TEXT` is spelled
+    /// `CAST('a' AS TEXT) COLLATE "C"`.
     Cast(&'a DataType),
     /// A literal operand the server converts when it reads the expression, spelled as the
     /// constant it becomes, such as `1` for `'1'` compared with an `INTEGER`.
     ///
-    /// The constant must be a literal or a cast of one, and only a literal operand takes it.
+    /// The constant must be a literal or a cast of one, and only a literal operand takes it. A
+    /// literal under `COLLATE` takes it only when the constant's type is not collatable, because
+    /// the constant replaces the collated literal and PostgreSQL drops such a collation.
     Constant(&'a Expr),
 }
 
