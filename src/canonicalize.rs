@@ -18,8 +18,8 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use crate::{
-    CanonicalizeError, Conversion, MembershipCoercions, MembershipElement, PatternCoercions,
-    SemanticContext,
+    CanonicalizeError, Conversion, MembershipCoercions, MembershipElement, OperatorCoercions,
+    PatternCoercions, SemanticContext,
 };
 
 const MAX_EXPR_DEPTH: usize = 128;
@@ -500,6 +500,25 @@ fn normalize_expr_inner(
         return pattern_text(&shape, &coercions, depth, context);
     }
 
+    if let Expr::Between {
+        expr: subject,
+        negated,
+        low,
+        high,
+    } = expr
+        && let Some(evidence) = context.evidence()
+        && let Some(range) = evidence.range_coercions(expr)?
+    {
+        let (low_operator, joiner, high_operator) = if *negated {
+            ("<", "OR", ">")
+        } else {
+            (">=", "AND", "<=")
+        };
+        let low = comparison_text(subject, low_operator, low, range.low, depth, context)?;
+        let high = comparison_text(subject, high_operator, high, range.high, depth, context)?;
+        return Ok(format!("({low} {joiner} {high})"));
+    }
+
     let text = match expr {
         Expr::BinaryOp { left, op, right } => {
             if context.is_semantic() {
@@ -513,21 +532,11 @@ fn normalize_expr_inner(
                         .transpose()?
                         .flatten()
                 };
-                let left = coerced_operand_text(
-                    left,
-                    coercions.and_then(|c| c.left),
-                    true,
-                    depth,
-                    context,
-                )?;
-                let right = coerced_operand_text(
-                    right,
-                    coercions.and_then(|c| c.right),
-                    true,
-                    depth,
-                    context,
-                )?;
-                format!("({left} {operator} {right})")
+                let coercions = coercions.unwrap_or(OperatorCoercions {
+                    left: None,
+                    right: None,
+                });
+                comparison_text(left, operator, right, coercions, depth, context)?
             } else if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                 let mut children = collect_flat_children(left, op);
                 children.extend(collect_flat_children(right, op));
@@ -1016,6 +1025,20 @@ fn normalize_expr_inner(
     })
 }
 
+/// Spells `(left operator right)` with each operand under its proved conversion.
+fn comparison_text(
+    left: &Expr,
+    operator: &str,
+    right: &Expr,
+    coercions: OperatorCoercions<'_>,
+    depth: usize,
+    context: &RenderContext<'_>,
+) -> Result<String, CanonicalizeError> {
+    let left = coerced_operand_text(left, coercions.left, true, depth, context)?;
+    let right = coerced_operand_text(right, coercions.right, true, depth, context)?;
+    Ok(format!("({left} {operator} {right})"))
+}
+
 /// Spells an operand under its proved conversion. `tight` encloses an operand left as written
 /// or a constant that does not enclose itself.
 fn coerced_operand_text(
@@ -1080,9 +1103,9 @@ fn membership_text(
                 )?);
             }
             MembershipElement::Comparison(coercions) => {
-                let left = coerced_operand_text(subject, coercions.left, true, depth, context)?;
-                let right = coerced_operand_text(element, coercions.right, true, depth, context)?;
-                comparisons.push(format!("({left} {operator} {right})"));
+                comparisons.push(comparison_text(
+                    subject, operator, element, coercions, depth, context,
+                )?);
             }
         }
     }

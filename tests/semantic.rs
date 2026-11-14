@@ -8,7 +8,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser_canonicalize::{
     ArrayCoercions, CanonicalizeError, Canonicalizer, Conversion, MembershipCoercions,
-    MembershipElement, OperatorCoercions, PatternCoercions, SemanticContext, hash_canonical,
+    MembershipElement, OperatorCoercions, PatternCoercions, RangeCoercions, SemanticContext,
+    hash_canonical,
 };
 
 struct Evidence<'a> {
@@ -17,6 +18,7 @@ struct Evidence<'a> {
     operators: Vec<(&'a Expr, OperatorCoercions<'a>)>,
     memberships: Vec<(&'a Expr, MembershipCoercions<'a>)>,
     patterns: Vec<(&'a Expr, PatternCoercions<'a>)>,
+    ranges: Vec<(&'a Expr, RangeCoercions<'a>)>,
     strict: bool,
 }
 
@@ -28,6 +30,7 @@ impl<'a> Evidence<'a> {
             operators: Vec::new(),
             memberships: Vec::new(),
             patterns: Vec::new(),
+            ranges: Vec::new(),
             strict: false,
         }
     }
@@ -113,6 +116,25 @@ impl SemanticContext for Evidence<'_> {
         }
         Ok(None)
     }
+
+    fn range_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<RangeCoercions<'_>>, CanonicalizeError> {
+        if let Some((_, range)) = self
+            .ranges
+            .iter()
+            .find(|(node, _)| ptr::eq(*node, occurrence))
+        {
+            return Ok(Some(*range));
+        }
+        if self.strict {
+            return Err(CanonicalizeError::Unsupported(
+                "foreign range occurrence".into(),
+            ));
+        }
+        Ok(None)
+    }
 }
 
 fn parse(sql: &str) -> Expr {
@@ -189,6 +211,7 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
         )],
         memberships: Vec::new(),
         patterns: Vec::new(),
+        ranges: Vec::new(),
         strict: true,
     };
     let catalog_context = Evidence {
@@ -203,6 +226,7 @@ fn proved_text_comparison_materializes_the_literal_conversion() {
         )],
         memberships: Vec::new(),
         patterns: Vec::new(),
+        ranges: Vec::new(),
         strict: true,
     };
     let source = normalize(&source_context).unwrap();
@@ -441,6 +465,116 @@ fn inconsistent_pattern_proofs_are_refused() {
             normalize(&context),
             Err(CanonicalizeError::Unsupported(_))
         ));
+    }
+}
+
+#[test]
+fn proved_ranges_compare_each_bound_as_postgresql_stores_it() {
+    let (numeric, text) = (data_type("NUMERIC"), data_type("TEXT"));
+    let minus_one = parse("'-1'::INTEGER");
+    let unconverted = OperatorCoercions {
+        left: None,
+        right: None,
+    };
+    let to_text = OperatorCoercions {
+        left: Some(Conversion::Cast(&text)),
+        right: Some(Conversion::Cast(&text)),
+    };
+    for (declared, proof, deparsed, canonical) in [
+        (
+            "n BETWEEN 1 AND 10.5",
+            RangeCoercions {
+                low: OperatorCoercions {
+                    left: None,
+                    right: Some(Conversion::Cast(&numeric)),
+                },
+                high: unconverted,
+            },
+            "((n >= (1)::numeric) AND (n <= 10.5))",
+            "((n >= CAST(1 AS NUMERIC)) AND (n <= 10.5))",
+        ),
+        (
+            "v NOT BETWEEN 1 AND g",
+            RangeCoercions {
+                low: unconverted,
+                high: unconverted,
+            },
+            "((v < 1) OR (v > g))",
+            "((v < 1) OR (v > g))",
+        ),
+        (
+            "vc NOT BETWEEN 'a' AND 'z'",
+            RangeCoercions {
+                low: to_text,
+                high: to_text,
+            },
+            "(((vc)::text < 'a'::text) OR ((vc)::text > 'z'::text))",
+            "((CAST(vc AS TEXT) < CAST('a' AS TEXT)) OR (CAST(vc AS TEXT) > CAST('z' AS TEXT)))",
+        ),
+        (
+            "v BETWEEN -1 AND 2",
+            RangeCoercions {
+                low: OperatorCoercions {
+                    left: None,
+                    right: Some(Conversion::Constant(&minus_one)),
+                },
+                high: unconverted,
+            },
+            "((v >= '-1'::integer) AND (v <= 2))",
+            "((v >= CAST('-1' AS INTEGER)) AND (v <= 2))",
+        ),
+    ] {
+        let declared = parse(declared);
+        let context = Evidence {
+            ranges: vec![(&declared, proof)],
+            ..Evidence::empty(&declared)
+        };
+        let declared = normalize(&context).unwrap();
+        assert_eq!(declared, canonical);
+        let deparsed = parse(deparsed);
+        assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
+    }
+}
+
+#[test]
+fn a_proved_range_nested_in_a_check_keeps_its_grouping() {
+    let unconverted = RangeCoercions {
+        low: OperatorCoercions {
+            left: None,
+            right: None,
+        },
+        high: OperatorCoercions {
+            left: None,
+            right: None,
+        },
+    };
+    for (declared, deparsed, canonical) in [
+        (
+            "NOT v BETWEEN 1 AND 2 AND v > 0",
+            "((NOT ((v >= 1) AND (v <= 2))) AND (v > 0))",
+            "((NOT ((v >= 1) AND (v <= 2))) AND (v > 0))",
+        ),
+        (
+            "(v BETWEEN 1 AND 2) = TRUE",
+            "(((v >= 1) AND (v <= 2)) = true)",
+            "(((v >= 1) AND (v <= 2)) = true)",
+        ),
+    ] {
+        let declared = parse(declared);
+        let Expr::BinaryOp { left, .. } = &declared else {
+            panic!("expected a binary operation")
+        };
+        let (Expr::UnaryOp { expr: range, .. } | Expr::Nested(range)) = left.as_ref() else {
+            panic!("expected a negated or parenthesized range")
+        };
+        let context = Evidence {
+            ranges: vec![(range, unconverted)],
+            ..Evidence::empty(&declared)
+        };
+        let declared = normalize(&context).unwrap();
+        assert_eq!(declared, canonical);
+        let deparsed = parse(deparsed);
+        assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
     }
 }
 
@@ -879,6 +1013,7 @@ fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
         )],
         memberships: Vec::new(),
         patterns: Vec::new(),
+        ranges: Vec::new(),
         strict: true,
     };
     let catalog_context = Evidence {
@@ -899,6 +1034,7 @@ fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
         )],
         memberships: Vec::new(),
         patterns: Vec::new(),
+        ranges: Vec::new(),
         strict: true,
     };
     let source = normalize(&source_context).unwrap();

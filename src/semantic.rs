@@ -72,6 +72,20 @@ pub struct PatternCoercions<'a> {
     pub escape: Option<Conversion<'a>>,
 }
 
+/// Proved conversions of a `BETWEEN` range, which PostgreSQL resolves into a comparison with
+/// each bound.
+///
+/// `x BETWEEN low AND high` becomes `x >= low AND x <= high`, and `NOT BETWEEN` becomes
+/// `x < low OR x > high`. The tested operand appears in both comparisons, so each one carries
+/// its own conversion of it.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeCoercions<'a> {
+    /// The conversions of the comparison with the low bound.
+    pub low: OperatorCoercions<'a>,
+    /// The conversions of the comparison with the high bound.
+    pub high: OperatorCoercions<'a>,
+}
+
 /// Authorizes semantic rendering operations on exact occurrences in one immutable expression.
 ///
 /// Implementations own the semantic proof, including resolved operation and conversion identities,
@@ -128,4 +142,17 @@ pub trait SemanticContext {
         &self,
         occurrence: &Expr,
     ) -> Result<Option<PatternCoercions<'_>>, CanonicalizeError>;
+
+    /// Returns the proved conversions of a `BETWEEN` occurrence, which is then spelled as the
+    /// two comparisons PostgreSQL stores.
+    ///
+    /// Both comparisons are bound by the same proof obligations as
+    /// [`operator_coercions`](Self::operator_coercions). `None` keeps the range as written.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign occurrence or unavailable required proof.
+    fn range_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<RangeCoercions<'_>>, CanonicalizeError>;
 }
