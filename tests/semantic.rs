@@ -1,7 +1,8 @@
 use core::ptr;
 
 use sqlparser::ast::{
-    DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, SelectItem, SetExpr,
+    BinaryOperator, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    SelectItem, SetExpr,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -527,6 +528,44 @@ fn inconsistent_membership_proofs_are_refused() {
             Err(CanonicalizeError::Unsupported(_))
         ));
     }
+}
+
+#[test]
+fn deeply_parenthesized_folded_literals_do_not_exhaust_the_stack() {
+    fn parenthesized(depth: usize) -> Expr {
+        let mut expr = parse("'1'");
+        for _ in 0..depth {
+            expr = Expr::Nested(Box::new(expr));
+        }
+        expr
+    }
+    let seven = parse("7");
+    let unfoldable = parse("i = j");
+    let deep_constant = parenthesized(1_000_000);
+    let deep_operand = Expr::BinaryOp {
+        left: Box::new(parse("i")),
+        op: BinaryOperator::Eq,
+        right: Box::new(parenthesized(1_000_000)),
+    };
+    let fold = |root, constant| {
+        normalize(&Evidence {
+            comparisons: vec![(
+                root,
+                ComparisonCoercions {
+                    left: None,
+                    right: Some(Conversion::Constant(constant)),
+                },
+            )],
+            ..Evidence::empty(root)
+        })
+    };
+    assert!(matches!(
+        fold(&unfoldable, &deep_constant),
+        Err(CanonicalizeError::Unsupported(_))
+    ));
+    assert_eq!(fold(&deep_operand, &seven), Ok("(i = 7)".to_string()));
+    // Dropping a million nested boxes recurses once per level.
+    core::mem::forget((deep_constant, deep_operand));
 }
 
 #[test]

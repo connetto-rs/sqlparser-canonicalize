@@ -1644,17 +1644,21 @@ fn literal_access() -> CanonicalizeError {
 ///
 /// A boolean counts only where `TRUE` is reserved, because SQLite reads `TRUE` and `FALSE` as
 /// columns of those names when the table has them.
-fn is_literal(expr: &Expr, context: &RenderContext<'_>) -> bool {
-    match expr {
-        Expr::Nested(inner) => is_literal(inner, context),
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus | UnaryOperator::Plus,
-            expr,
-        } => is_literal(expr, context),
-        Expr::Value(value) => {
-            context.canonicalizer.true_is_reserved || !matches!(value.value, Value::Boolean(_))
+fn is_literal(mut expr: &Expr, context: &RenderContext<'_>) -> bool {
+    // A loop, because a tree built in code can nest deeper than the stack allows.
+    loop {
+        match expr {
+            Expr::Nested(inner)
+            | Expr::UnaryOp {
+                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                expr: inner,
+            } => expr = inner,
+            Expr::Value(value) => {
+                return context.canonicalizer.true_is_reserved
+                    || !matches!(value.value, Value::Boolean(_));
+            }
+            _ => return false,
         }
-        _ => false,
     }
 }
 
