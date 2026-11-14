@@ -2,7 +2,7 @@ use core::ptr;
 
 use sqlparser::ast::{
     BinaryOperator, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    SelectItem, SetExpr,
+    InTarget, SelectItem, SetExpr,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -498,29 +498,71 @@ fn inconsistent_membership_proofs_are_refused() {
     let one = parse("1");
     let to_text = Some(Conversion::Cast(&text));
     let root = parse("s IN ('a', u)");
-    for membership in [
-        MembershipCoercions {
-            array: None,
-            elements: &[compared(None, to_text)],
-        },
-        MembershipCoercions {
-            array: None,
-            elements: &[in_array(to_text), compared(None, None)],
-        },
-        MembershipCoercions {
-            array: PLAIN_ARRAY,
-            elements: &[compared(None, to_text), compared(None, None)],
-        },
-        MembershipCoercions {
-            array: None,
-            elements: &[
-                compared(None, to_text),
-                compared(None, Some(Conversion::Constant(&one))),
-            ],
-        },
+    let empty = Expr::In {
+        expr: Box::new(parse("s")),
+        target: InTarget::List(Vec::new()),
+        negated: false,
+        global: false,
+    };
+    for (root, membership) in [
+        (
+            &root,
+            MembershipCoercions {
+                array: None,
+                elements: &[compared(None, to_text)],
+            },
+        ),
+        (
+            &root,
+            MembershipCoercions {
+                array: None,
+                elements: &[in_array(to_text), compared(None, None)],
+            },
+        ),
+        (
+            &root,
+            MembershipCoercions {
+                array: PLAIN_ARRAY,
+                elements: &[compared(None, to_text), compared(None, None)],
+            },
+        ),
+        (
+            &root,
+            MembershipCoercions {
+                array: None,
+                elements: &[
+                    compared(None, to_text),
+                    compared(None, Some(Conversion::Constant(&one))),
+                ],
+            },
+        ),
+        (
+            &empty,
+            MembershipCoercions {
+                array: None,
+                elements: &[],
+            },
+        ),
     ] {
         let context = Evidence {
-            memberships: vec![(&root, membership)],
+            memberships: vec![(root, membership)],
+            ..Evidence::empty(root)
+        };
+        assert!(matches!(
+            normalize(&context),
+            Err(CanonicalizeError::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn folding_a_column_into_a_constant_is_refused() {
+    let root = parse("i = j");
+    let one = parse("1");
+    let fold = Some(Conversion::Constant(&one));
+    for (left, right) in [(fold, None), (None, fold)] {
+        let context = Evidence {
+            comparisons: vec![(&root, ComparisonCoercions { left, right })],
             ..Evidence::empty(&root)
         };
         assert!(matches!(
