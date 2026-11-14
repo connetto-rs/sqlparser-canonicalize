@@ -968,6 +968,9 @@ fn normalize_expr_inner(
 
 /// Spells an operand under its proved conversion. `tight` encloses an operand left as written
 /// or a constant that does not enclose itself.
+///
+/// A conversion goes under the operand's `COLLATE` clauses, where PostgreSQL applies it. A cast
+/// keeps them, and a constant drops them with the literal it replaces.
 fn coerced_operand_text(
     expr: &Expr,
     conversion: Option<Conversion<'_>>,
@@ -975,24 +978,64 @@ fn coerced_operand_text(
     depth: usize,
     context: &RenderContext<'_>,
 ) -> Result<String, CanonicalizeError> {
+    let Some(conversion) = conversion else {
+        return normalize_expr_inner(expr, depth + 1, tight, context);
+    };
+    let (operand, collations) = collated_operand(expr);
+    let depth = depth + collations.len();
+    if depth > MAX_EXPR_DEPTH {
+        return Err(CanonicalizeError::TooDeep {
+            limit: MAX_EXPR_DEPTH,
+        });
+    }
     match conversion {
-        None => normalize_expr_inner(expr, depth + 1, tight, context),
-        Some(Conversion::Cast(target)) => Ok(format!(
-            "CAST({} AS {target})",
-            normalize_expr_inner(expr, depth + 1, false, context)?
-        )),
-        Some(Conversion::Constant(constant)) => {
+        Conversion::Cast(target) => {
+            let mut text = format!(
+                "CAST({} AS {target})",
+                normalize_expr_inner(operand, depth + 1, false, context)?
+            );
+            for (index, collation) in collations.iter().rev().enumerate() {
+                text = if index + 1 == collations.len() && !tight {
+                    format!("{text} COLLATE {collation}")
+                } else {
+                    format!("({text} COLLATE {collation})")
+                };
+            }
+            Ok(text)
+        }
+        Conversion::Constant(constant) => {
             let is_constant = match constant {
                 Expr::Cast { expr, .. } => is_literal(expr, context),
                 constant => is_literal(constant, context),
             };
-            if !is_literal(expr, context) || !is_constant {
+            if !is_literal(operand, context) || !is_constant {
                 return Err(CanonicalizeError::Unsupported(
                     "Only a literal converts to a constant, which must be a literal or a cast of one"
                         .to_string(),
                 ));
             }
             normalize_expr_inner(constant, depth + 1, tight, context)
+        }
+    }
+}
+
+/// Strips the parentheses and `COLLATE` clauses enclosing an operand, returning the operand and
+/// its collations from the outermost in. An operand with no `COLLATE` is returned unchanged.
+fn collated_operand(expr: &Expr) -> (&Expr, Vec<&ObjectName>) {
+    let mut operand = expr;
+    let mut collations = Vec::new();
+    loop {
+        match operand {
+            Expr::Nested(inner) => operand = inner,
+            Expr::Collate {
+                expr: inner,
+                collation,
+            } => {
+                collations.push(collation);
+                operand = inner;
+            }
+            _ if collations.is_empty() => return (expr, collations),
+            _ => return (operand, collations),
         }
     }
 }

@@ -493,6 +493,77 @@ fn a_folded_literal_comparison_matches_its_deparse() {
 }
 
 #[test]
+fn a_conversion_goes_under_the_collation_as_postgresql_applies_it() {
+    let text = data_type("TEXT");
+    let to_text = Some(Conversion::Cast(&text));
+    let one = parse("1");
+    let to_one = Some(Conversion::Constant(&one));
+    for (declared, left, right, deparsed, canonical) in [
+        (
+            "s = 'a' COLLATE \"C\"",
+            None,
+            to_text,
+            "(s = ('a'::text COLLATE \"C\"))",
+            "(s = (CAST('a' AS TEXT) COLLATE \"C\"))",
+        ),
+        (
+            "s = (('a') COLLATE \"C\")",
+            None,
+            to_text,
+            "(s = ('a'::text COLLATE \"C\"))",
+            "(s = (CAST('a' AS TEXT) COLLATE \"C\"))",
+        ),
+        (
+            "vc = ('a' COLLATE \"C\")",
+            to_text,
+            to_text,
+            "((vc)::text = ('a'::text COLLATE \"C\"))",
+            "(CAST(vc AS TEXT) = (CAST('a' AS TEXT) COLLATE \"C\"))",
+        ),
+        ("v = '1' COLLATE \"C\"", None, to_one, "(v = 1)", "(v = 1)"),
+    ] {
+        let declared = parse(declared);
+        let context = Evidence {
+            comparisons: vec![(&declared, ComparisonCoercions { left, right })],
+            ..Evidence::empty(&declared)
+        };
+        let declared = normalize(&context).unwrap();
+        assert_eq!(declared, canonical);
+        let deparsed = parse(deparsed);
+        assert_eq!(declared, normalize(&Evidence::empty(&deparsed)).unwrap());
+    }
+}
+
+#[test]
+fn an_in_list_element_converts_under_its_collation() {
+    let text = data_type("TEXT");
+    let to_text = Some(Conversion::Cast(&text));
+    let (one, two) = (parse("1"), parse("2"));
+    assert_eq!(
+        reconcile_membership(
+            "s IN ('a' COLLATE \"C\", 'b')",
+            MembershipCoercions {
+                array: PLAIN_ARRAY,
+                elements: &[in_array(to_text), in_array(to_text)],
+            },
+            "(s = ANY (ARRAY[('a'::text COLLATE \"C\"), 'b'::text]))",
+        ),
+        "s = ANY(ARRAY[CAST('a' AS TEXT) COLLATE \"C\", CAST('b' AS TEXT)])"
+    );
+    reconcile_membership(
+        "v IN ('1' COLLATE \"C\", '2')",
+        MembershipCoercions {
+            array: PLAIN_ARRAY,
+            elements: &[
+                in_array(Some(Conversion::Constant(&one))),
+                in_array(Some(Conversion::Constant(&two))),
+            ],
+        },
+        "(v = ANY (ARRAY[1, 2]))",
+    );
+}
+
+#[test]
 fn inconsistent_membership_proofs_are_refused() {
     let text = data_type("TEXT");
     let one = parse("1");
