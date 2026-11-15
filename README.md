@@ -27,7 +27,7 @@ Canonical text, and so every hash, is stable within a minor version. A new minor
 
 The dialect belongs to the canonicalizer because it decides the answer: whether `"Status"` and `Status` are one column or two is a PostgreSQL question, not a SQL one.
 
-For schema-backed expressions, `normalize_with_context` consumes a `SemanticContext` that authorizes bound column spellings, equivalent explicit comparison casts, literals folded into the constants the server reads, and PostgreSQL's resolution of an `IN` list into `= ANY(ARRAY[...])` and per-element comparisons. It preserves operation order and existing casts, and only drops a PostgreSQL scalar projection alias when the supported query structure rules out output-name references. The provider must prove conversion identity, collation, typmod, and implicit-versus-explicit behavior in the execution scope.
+For schema-backed expressions, `normalize_with_context` consumes a `SemanticContext` that authorizes bound column spellings, equivalent explicit casts on binary operator operands, literals folded into the constants the server reads, and PostgreSQL's resolution of an `IN` list into `= ANY(ARRAY[...])` and per-element comparisons. It preserves operation order and existing casts, and only drops a PostgreSQL scalar projection alias when the supported query structure rules out output-name references. The provider must prove conversion identity, collation, typmod, and implicit-versus-explicit behavior in the execution scope.
 
 Normalization is O(n log n) for `AND` and `OR` chains because operands are sorted, and O(n) for other syntax tree shapes.
 
