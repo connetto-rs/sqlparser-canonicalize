@@ -13,7 +13,7 @@ mod semantic;
 pub use canonicalize::{Canonicalizer, hash_canonical};
 pub use semantic::{
     ArrayCoercions, Conversion, MembershipCoercions, MembershipElement, OperatorCoercions,
-    PatternCoercions, SemanticContext,
+    PatternCoercions, RangeCoercions, SemanticContext,
 };
 
 /// Why a predicate could not be turned into canonical text.
