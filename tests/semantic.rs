@@ -890,7 +890,7 @@ fn a_conversion_goes_under_the_collation_as_postgresql_applies_it() {
     ] {
         let declared = parse(declared);
         let context = Evidence {
-            comparisons: vec![(&declared, ComparisonCoercions { left, right })],
+            operators: vec![(&declared, OperatorCoercions { left, right })],
             ..Evidence::empty(&declared)
         };
         let declared = normalize(&context).unwrap();
