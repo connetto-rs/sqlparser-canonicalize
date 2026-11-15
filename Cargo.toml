@@ -13,11 +13,13 @@ categories = ["database", "parser-implementations", "no-std"]
 
 [features]
 default = ["std"]
-# Lets the SQL parser grow its stack on demand, so deeply nested input is refused instead of
-# aborting the process. Turning this off keeps the crate `no_std` and gives up that guarantee.
-std = ["sqlparser/recursive-protection"]
+# Lets the SQL parser and the renderer grow their stacks on demand, so deeply nested input is
+# refused instead of aborting the process. Turning this off keeps the crate `no_std` and gives
+# up that guarantee.
+std = ["sqlparser/recursive-protection", "dep:recursive"]
 
 [dependencies]
+recursive = { version = "0.1.1", optional = true }
 seahash = { version = "4.1", default-features = false }
 # Follows apache main until a sqlparser release carries `Expr::In` with its `global` field.
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main", default-features = false }

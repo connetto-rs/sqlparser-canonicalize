@@ -177,10 +177,27 @@ fn read_back(canonical: &str, context: &RenderContext<'_>) -> Option<String> {
         .ok()?;
     let expr = parser.parse_expr().ok()?;
     // parse_expr takes a leading expression and stops, so require nothing to trail it.
-    if !matches!(parser.peek_token_ref().token, Token::EOF) {
-        return None;
+    let again = matches!(parser.peek_token_ref().token, Token::EOF)
+        .then(|| normalize_expr_inner(&expr, 0, false, context).ok())
+        .flatten();
+    drop_operator_chains(expr);
+    again
+}
+
+/// Drops `expr` through a worklist over its binary operations and parentheses.
+///
+/// A parser builds an operator chain as deep as it is long without recursing, and dropping it
+/// node by node would recurse once per operand. Every other nesting is bounded by the parser's
+/// recursion limit, so it drops as usual.
+fn drop_operator_chains(expr: Expr) {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::BinaryOp { left, right, .. } => pending.extend([*left, *right]),
+            Expr::Nested(inner) => pending.push(*inner),
+            _ => {}
+        }
     }
-    normalize_expr_inner(&expr, 0, false, context).ok()
 }
 
 /// Returns the stable 128-bit SeaHash value for canonical text.
@@ -399,6 +416,9 @@ const fn limit_clause_name(limit: Option<&LimitClause>) -> &'static str {
     }
 }
 
+/// Spells `expr` canonically. Every recursion of the renderer passes through here, so with `std`
+/// this is where the stack grows when deep nesting would otherwise exhaust it.
+#[cfg_attr(feature = "std", recursive::recursive)]
 fn normalize_expr_inner(
     expr: &Expr,
     depth: usize,
@@ -2208,16 +2228,24 @@ fn quoting_survives_printing(text: &str, quote: char) -> bool {
     true
 }
 
+/// Collects the operands of a chain of `operator`, through parentheses, from left to right.
+///
+/// A worklist, because a chain is as long as the predicate and a parser builds it without
+/// recursing.
 fn collect_flat_children<'a>(expr: &'a Expr, operator: &BinaryOperator) -> Vec<&'a Expr> {
-    match expr {
-        Expr::Nested(inner) => collect_flat_children(inner, operator),
-        Expr::BinaryOp { left, op, right } if op == operator => {
-            let mut children = collect_flat_children(left, operator);
-            children.extend(collect_flat_children(right, operator));
-            children
+    let mut children = Vec::new();
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::Nested(inner) => pending.push(inner),
+            Expr::BinaryOp { left, op, right } if op == operator => {
+                pending.push(right);
+                pending.push(left);
+            }
+            _ => children.push(expr),
         }
-        _ => vec![expr],
     }
+    children
 }
 
 /// Reads how `operator` treats the order of its operands under the canonicalizer's dialect.

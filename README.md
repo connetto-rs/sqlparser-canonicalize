@@ -31,4 +31,4 @@ For schema-backed expressions, `normalize_with_context` consumes a `SemanticCont
 
 Normalization is O(n log n) for `AND` and `OR` chains because operands are sorted, and O(n) for other syntax tree shapes.
 
-The crate works without the standard library if you turn off default features, at the cost of the parser's stack protection, so that configuration can be crashed by deeply nested input and should only take SQL you trust.
+The crate works without the standard library if you turn off default features, at the cost of the stack protection in the parser and the renderer, so that configuration can be crashed by deeply nested input and should only take SQL you trust.
