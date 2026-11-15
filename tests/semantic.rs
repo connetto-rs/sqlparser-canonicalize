@@ -1047,6 +1047,78 @@ fn deeply_parenthesized_folded_literals_do_not_exhaust_the_stack() {
     core::mem::forget((deep_constant, deep_operand));
 }
 
+/// Every nesting shape reaches the depth limit and is refused, on a stack far smaller than the
+/// limit's frames need, because the renderer grows its stack on demand.
+#[cfg(feature = "std")]
+#[test]
+fn nesting_past_the_depth_limit_is_refused_on_a_small_stack() {
+    const DEPTH: usize = 200;
+    let shapes = [
+        format!("{}a{}", "(".repeat(DEPTH), ")".repeat(DEPTH)),
+        format!("{}a", "NOT ".repeat(DEPTH)),
+        format!("{}a{}", "(1 + ".repeat(DEPTH), ")".repeat(DEPTH)),
+        format!("{}a{}", "(".repeat(DEPTH), " IS NULL)".repeat(DEPTH)),
+        format!("{}a{}", "(1 IN (".repeat(DEPTH), "))".repeat(DEPTH)),
+        format!("{}a{}", "f(".repeat(DEPTH), ")".repeat(DEPTH)),
+        format!("{}a{}", "CAST(".repeat(DEPTH), " AS INT)".repeat(DEPTH)),
+        format!(
+            "{}a{}",
+            "CASE WHEN ".repeat(DEPTH),
+            " THEN 1 END".repeat(DEPTH)
+        ),
+        format!("{}a{}", "ARRAY[".repeat(DEPTH), "]".repeat(DEPTH)),
+    ];
+    for sql in shapes {
+        let root = Parser::new(&PostgreSqlDialect {})
+            .with_recursion_limit(4 * DEPTH)
+            .try_with_sql(&sql)
+            .unwrap()
+            .parse_expr()
+            .unwrap();
+        let (schema_free, semantic) = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn_scoped(scope, || {
+                    let canonicalizer = Canonicalizer::new(&PostgreSqlDialect {});
+                    (
+                        canonicalizer.normalize_where_clause(Some(&root)),
+                        canonicalizer.normalize_with_context(&Evidence::empty(&root)),
+                    )
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        let too_deep = Err(CanonicalizeError::TooDeep { limit: 128 });
+        assert_eq!(schema_free, too_deep, "{sql}");
+        assert_eq!(semantic, too_deep, "{sql}");
+    }
+}
+
+/// A chain of `AND` or `OR` is flat however long it is, so its length never counts against the
+/// depth limit or the stack.
+#[test]
+fn a_long_boolean_chain_renders_on_a_small_stack() {
+    const TERMS: usize = 10_000;
+    for operator in ["AND", "OR"] {
+        let sql = format!("a{}", format!(" {operator} a").repeat(TERMS));
+        let root = parse(&sql);
+        let canonical = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn_scoped(scope, || {
+                    Canonicalizer::new(&PostgreSqlDialect {}).normalize_where_clause(Some(&root))
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        assert_eq!(canonical.unwrap().len(), sql.len() + 2);
+        // Dropping the chain recurses once per term.
+        core::mem::forget(root);
+    }
+}
+
 #[test]
 fn proved_numeric_comparison_keeps_numeric_conversion_and_scoped_columns() {
     let source = parse("weight > (SELECT avg(weight) FROM \"public\".\"paper_shares\")");

@@ -727,6 +727,7 @@ version = "0.2.1"
 dependencies = [
  "criterion",
  "proptest",
+ "recursive",
  "seahash",
  "sqlparser",
  "thiserror",
